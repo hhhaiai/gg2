@@ -39,21 +39,7 @@ router = APIRouter(tags=["Admin - Tokens"])
 # Token sanitisation
 # ---------------------------------------------------------------------------
 
-_TOKEN_TRANS = str.maketrans({
-    "\u2010": "-", "\u2011": "-", "\u2012": "-",
-    "\u2013": "-", "\u2014": "-", "\u2212": "-",
-    "\u00a0": " ", "\u2007": " ", "\u202f": " ",
-    "\u200b": "", "\u200c": "", "\u200d": "", "\ufeff": "",
-})
-_STRIP_RE = re.compile(r"\s+")
-
-
-def _sanitize(value: str) -> str:
-    tok = str(value or "").translate(_TOKEN_TRANS)
-    tok = _STRIP_RE.sub("", tok)
-    if tok.startswith("sso="):
-        tok = tok[4:]
-    return tok.encode("ascii", errors="ignore").decode("ascii")
+from app.platform.text.sanitize import sanitize_token as _sanitize
 
 
 def _mask(token: str) -> str:

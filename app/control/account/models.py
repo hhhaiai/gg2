@@ -237,33 +237,11 @@ class AccountRecord(BaseModel):
     @field_validator("token", mode="before")
     @classmethod
     def _normalize_token(cls, v: Any) -> str:
+        from app.platform.text.sanitize import sanitize_token
+
         if v is None:
             raise ValueError("token cannot be None")
-        token = str(v)
-        # Normalise Unicode dash / space variants and strip zero-width chars.
-        token = token.translate(
-            str.maketrans(
-                {
-                    "\u2010": "-",
-                    "\u2011": "-",
-                    "\u2012": "-",
-                    "\u2013": "-",
-                    "\u2014": "-",
-                    "\u2212": "-",
-                    "\u00a0": " ",
-                    "\u2007": " ",
-                    "\u202f": " ",
-                    "\u200b": "",
-                    "\u200c": "",
-                    "\u200d": "",
-                    "\ufeff": "",
-                }
-            )
-        )
-        token = "".join(token.split())
-        if token.startswith("sso="):
-            token = token[4:]
-        token = token.encode("ascii", errors="ignore").decode("ascii")
+        token = sanitize_token(v)
         if not token:
             raise ValueError("token is empty after normalisation")
         return token
