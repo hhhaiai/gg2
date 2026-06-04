@@ -184,27 +184,67 @@ async def save_tokens(
     repo: "AccountRepository" = Depends(get_repo),
     refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
 ):
-    """Full pool replace — accepts {pool_name: [token_objects]} dict."""
-    total_upserted = 0
-    all_tokens: list[str] = []
+    """Additive bulk import — accepts ``{pool_name: [str | {token, tags}]}``.
+
+    Adds every supplied token to its target pool, skipping ones that are already
+    active. Soft-deleted rows are restored via the upsert path (``deleted_at``
+    is cleared on conflict). Existing pool members are left untouched — to
+    purge a pool, use the explicit DELETE endpoint first.
+
+    Behaviour was destructive (``repo.replace_pool``) before 2026-06-04 and
+    was changed after a JSON import wiped a 150k-token pool by accident.
+    """
+    upserts: list[AccountUpsert] = []
+    seen: set[tuple[str, str]] = set()
 
     for pool_name, items in req.root.items():
-        upserts = []
         for item in items:
             td = {"token": item} if isinstance(item, str) else item.model_dump()
             token_val = _sanitize(td.get("token", ""))
             if not token_val:
                 continue
-            upserts.append(AccountUpsert(token=token_val, pool=pool_name, tags=td.get("tags") or []))
-        if upserts:
-            await repo.replace_pool(BulkReplacePoolCommand(pool=pool_name, upserts=upserts))
-            all_tokens.extend(u.token for u in upserts)
-            total_upserted += len(upserts)
+            key = (pool_name, token_val)
+            if key in seen:
+                continue
+            seen.add(key)
+            upserts.append(
+                AccountUpsert(token=token_val, pool=pool_name, tags=td.get("tags") or [])
+            )
 
-    logger.info("admin tokens saved across pools: saved_count={}", total_upserted)
-    if all_tokens:
-        asyncio.create_task(_refresh_imported(refresh_svc, all_tokens))
-    return _json({"status": "success", "count": total_upserted})
+    if not upserts:
+        return _json({"status": "success", "count": 0, "skipped": 0, "restored": 0})
+
+    # Single DB roundtrip: classify each requested token as already-active,
+    # soft-deleted (will be restored by upsert), or brand-new.
+    existing_records = await repo.get_accounts([u.token for u in upserts])
+    existing_active: set[str] = set()
+    existing_soft_deleted: set[str] = set()
+    for r in existing_records:
+        if r.is_deleted():
+            existing_soft_deleted.add(r.token)
+        else:
+            existing_active.add(r.token)
+
+    new_upserts = [u for u in upserts if u.token not in existing_active]
+    skipped = sum(1 for u in upserts if u.token in existing_active)
+    restored = sum(1 for u in new_upserts if u.token in existing_soft_deleted)
+
+    if new_upserts:
+        await repo.upsert_accounts(new_upserts)
+
+    logger.info(
+        "admin tokens imported (additive): total_requested={} added={} skipped={} restored={}",
+        len(upserts), len(new_upserts), skipped, restored,
+    )
+
+    if new_upserts:
+        asyncio.create_task(_refresh_imported(refresh_svc, [u.token for u in new_upserts]))
+    return _json({
+        "status": "success",
+        "count": len(new_upserts),
+        "skipped": skipped,
+        "restored": restored,
+    })
 
 
 @router.post("/tokens/add")
