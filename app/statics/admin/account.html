@@ -1098,6 +1098,10 @@ const PAGE_SIZE_KEY = 'admin.account.page_size';
 const PAGE_SIZE_OPTIONS = [50, 100, 200, 500, 1000, 2000];
 
 let allTokens = [], curStatus = 'all', curNsfw = 'all', curPool = 'all', curPage = 1, pageSize = loadSavedPageSize();
+let apiTotal = 0;
+let apiTotalPages = 0;
+let isLoadingAll = false;
+let _loadToastId = null;
 const sel = new Set();
 const refreshingTokens = new Set();
 let _cb = null;
@@ -1182,22 +1186,82 @@ let selectionStrategy = 'quota';
 
 // ── Load ───────────────────────────────────────────────────────────────────
 async function load() {
+  if (isLoadingAll) return;
+  isLoadingAll = true;
   try {
     const [data, status] = await Promise.all([
-      _api('GET', '/tokens'),
+      _api('GET', `/tokens?page=1&page_size=${pageSize}`),
       _api('GET', '/status').catch(() => null),
     ]);
     if (status && typeof status.selection_strategy === 'string') {
       selectionStrategy = status.selection_strategy;
     }
-    allTokens = Array.isArray(data.tokens)
+    apiTotal = Number(data.total) || 0;
+    apiTotalPages = Number(data.total_pages) || 1;
+    const firstPage = Array.isArray(data.tokens)
       ? data.tokens
       : Object.entries(data.tokens || {}).flatMap(([pool, items]) =>
           Array.isArray(items) ? items.map(t => ({ ...t, pool: t.pool || pool })) : []);
+    allTokens = firstPage;
+    // Backwards-compat: the upstream admin endpoint returns the full 140k-row
+    // payload in a single response with no pagination metadata. Detect that
+    // shape and synthesize total/total_pages so the rest of the UI works.
+    if (data.total != null) {
+      apiTotal = Number(data.total) || allTokens.length;
+      apiTotalPages = Number(data.total_pages) || 1;
+    } else {
+      apiTotal = allTokens.length;
+      apiTotalPages = 1;
+    }
+    curPage = 1;
     applyStrategyUI();
     invalidateTokenView();
     render();
+
+    if (apiTotalPages > 1) {
+      await _loadRemainingPages();
+    }
   } catch (e) { showToast(`${tr('account.loadFailed', null, '加载失败')}: ${e.message}`, 'error'); }
+  finally { isLoadingAll = false; }
+}
+
+// Background-fetch remaining pages so filter chips / pagination reflect the full
+// dataset, not just the first page. Concurrency is bounded to keep the API server
+// (and the user's network) responsive.
+async function _loadRemainingPages() {
+  const CONCURRENCY = 6;
+  const remaining = [];
+  for (let p = 2; p <= apiTotalPages; p++) remaining.push(p);
+  let done = 0;
+  _loadToastId = showProgressToast(
+    tr('account.loadingProgressInit', { total: remaining.length },
+      `正在加载剩余账户… 共 ${remaining.length} 页`),
+  );
+  _loadToastId.update(0, remaining.length);
+  try {
+    for (let i = 0; i < remaining.length; i += CONCURRENCY) {
+      const batch = remaining.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(batch.map((p) =>
+        _api('GET', `/tokens?page=${p}&page_size=${pageSize}`)
+          .then((d) => Array.isArray(d.tokens) ? d.tokens : [])
+          .catch(() => [])
+      ));
+      for (const arr of results) allTokens.push(...arr);
+      done += batch.length;
+      _loadToastId.update(done, remaining.length);
+      invalidateTokenView();
+      render();
+    }
+    _loadToastId.finish(
+      tr('account.loadedAll', { n: allTokens.length },
+        `已加载全部 ${allTokens.length} 个账户`),
+      'success',
+    );
+  } catch (e) {
+    _loadToastId.finish(`${tr('account.loadFailed', null, '加载失败')}: ${e.message}`, 'error');
+  } finally {
+    _loadToastId = null;
+  }
 }
 
 function applyStrategyUI() {
@@ -1326,7 +1390,16 @@ function isInvalidStatus(status) {
 
 function renderStats(view = getTokenView()) {
   const { stats } = view;
-  $('s-total',   allTokens.length);
+  // s-total reflects the server's total (apiTotal). The local allTokens array
+  // may be only partially loaded while _loadRemainingPages is in flight, so
+  // we must NOT use allTokens.length here — that would show "50" even when
+  // there are 140k records on the server.
+  const totalDisplay = apiTotal > 0
+    ? (allTokens.length < apiTotal
+        ? `${fmt(apiTotal)} (${fmt(allTokens.length)})`
+        : fmt(apiTotal))
+    : allTokens.length;
+  $('s-total',   totalDisplay);
   $('s-active',  stats.active);
   $('s-cooling', stats.cooling);
   $('s-invalid', stats.invalid);
@@ -1568,8 +1641,9 @@ function switchPool(pool) {
     renderTable();
   });
 }
-function prevPage() { if (curPage > 1) { curPage--; renderTable(); } }
+function prevPage() { if (isLoadingAll) return; if (curPage > 1) { curPage--; renderTable(); } }
 function nextPage() {
+  if (isLoadingAll) return;
   const pages = Math.max(1, Math.ceil(getTokenView().filteredItems.length / pageSize));
   if (curPage < pages) { curPage++; renderTable(); }
 }
@@ -1578,7 +1652,11 @@ function changePageSize(v) {
   pageSize = PAGE_SIZE_OPTIONS.includes(next) ? next : 50;
   localStorage.setItem(PAGE_SIZE_KEY, String(pageSize));
   curPage = 1;
-  renderTable();
+  // If the dataset is still being loaded in the background, the in-flight
+  // fetch is using the old pageSize, so we re-trigger load() to refetch
+  // with the new granularity. Otherwise the local slice is sufficient.
+  if (allTokens.length < apiTotal) load();
+  else renderTable();
 }
 
 function toggleAll(checked) {
