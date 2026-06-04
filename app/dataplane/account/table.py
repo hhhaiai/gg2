@@ -183,6 +183,8 @@ class AccountRuntimeTable:
     mode_available: dict[tuple[int, int], set[int]] = field(default_factory=dict)
     # tag string → set of idx
     tag_idx: dict[str, set[int]] = field(default_factory=dict)
+    # idx → list[str] of tags (O(1) reverse lookup for incremental sync)
+    tags_by_idx: list[list[str]] = field(default_factory=list)
 
     # --- Metadata ---
     revision: int = 0
@@ -347,6 +349,7 @@ class AccountRuntimeTable:
         self.size += 1
         self._add_to_indexes(idx)
         self._add_to_tag_idx(idx, tags)
+        self.tags_by_idx.append(list(tags))
         return idx
 
     # ---------------------------------------------------------------------------
@@ -425,6 +428,11 @@ class AccountRuntimeTable:
 
         self._add_to_indexes(idx)
         self._add_to_tag_idx(idx, new_tags)
+        # O(1) update: replace the idx → tags entry in place
+        if idx < len(self.tags_by_idx):
+            self.tags_by_idx[idx] = list(new_tags)
+        else:
+            self.tags_by_idx.append(list(new_tags))
 
     # ---------------------------------------------------------------------------
     # Public read accessors

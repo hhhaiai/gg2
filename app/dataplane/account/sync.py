@@ -136,11 +136,9 @@ async def apply_changes(
             existing = table.idx_by_token.get(record.token)
 
             if existing is not None:
-                old_tags = []
-                # Collect old tags from tag_idx (reverse lookup).
-                for tag, bucket in list(table.tag_idx.items()):
-                    if existing in bucket:
-                        old_tags.append(tag)
+                # O(1) reverse lookup via tags_by_idx — previously O(n_tags) per
+                # token: scanned all tag buckets looking for the old idx.
+                old_tags = table.tags_by_idx[existing] if existing < len(table.tags_by_idx) else []
                 table._update_slot(existing, **args, old_tags=old_tags, new_tags=tags)
             else:
                 table._append_slot(record.token, **args, tags=tags)
