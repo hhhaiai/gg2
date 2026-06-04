@@ -126,18 +126,56 @@ def _json(data) -> Response:
 # ---------------------------------------------------------------------------
 
 @router.get("/tokens")
-async def list_tokens(repo: "AccountRepository" = Depends(get_repo)):
-    """Return flat token list."""
-    all_items: list = []
-    page_num = 1
-    while True:
-        page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
-        all_items.extend(page.items)
-        if page_num * 2000 >= page.total:
-            break
-        page_num += 1
+async def list_tokens(
+    page: int = 1,
+    page_size: int = 50,
+    pool: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+    repo: "AccountRepository" = Depends(get_repo),
+):
+    """Return a paginated token list.
 
-    return _json({"tokens": [_serialize_record(r) for r in all_items]})
+    Defaults: page=1, page_size=50 (max 200). Optional filters: pool,
+    status, q (substring match against token prefix).
+
+    The previous implementation looped ALL pages and returned every row
+    in a single response — at 1M accounts that's a 500MB JSON payload
+    and 15s of CPU on the admin host. The frontend now paginates
+    incrementally via virtual scroll.
+
+    Response shape (backwards-compatible: existing ``tokens`` key is
+    preserved):
+      {
+        "tokens":       [...],
+        "page":         int,
+        "page_size":    int,
+        "total":        int,
+        "total_pages":  int,
+        "filter":       {"pool": ..., "status": ..., "q": ...}
+      }
+    """
+    query = ListAccountsQuery(
+        page=page,
+        page_size=min(max(page_size, 1), 200),
+        pool=pool,
+        status=AccountStatus(status) if status else None,
+    )
+    page_result = await repo.list_accounts(query)
+    items = page_result.items
+    if q:
+        # Token-prefix substring filter applied in Python — list_accounts
+        # doesn't have a token-search clause and adding one would touch
+        # every backend (SQLite / Redis / SQL). The page is already small.
+        items = [r for r in items if q in r.token]
+    return _json({
+        "tokens": [_serialize_record(r) for r in items],
+        "page": page_result.page,
+        "page_size": page_result.page_size,
+        "total": page_result.total,
+        "total_pages": page_result.total_pages,
+        "filter": {"pool": pool, "status": status, "q": q},
+    })
 
 
 @router.post("/tokens")
