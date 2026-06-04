@@ -248,6 +248,22 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 chat_format=True,
             )
 
+        elif spec.is_console_image():
+            from .console_images import generate as console_img_gen
+
+            cfg = req.image_config or ImageConfig()
+            size = cfg.size or "1024x1024"
+            fmt = cfg.response_format or "url"
+            n = cfg.n or 1
+            _validate_image_n(req.model, n, param="image_config.n")
+            result = await console_img_gen(
+                model=req.model,
+                messages=messages,
+                n=n,
+                size=size,
+                response_format=fmt,
+            )
+
         elif spec.is_image():
             from .images import generate as img_gen
 
@@ -435,12 +451,29 @@ async def responses_endpoint(req: ResponsesCreateRequest):
 )
 async def image_generations(req: ImageGenerationRequest):
     spec = model_registry.get(req.model)
-    if spec is None or not spec.enabled or not spec.is_image():
+    if spec is None or not spec.enabled:
         raise ValidationError(
-            f"Model {req.model!r} is not an image model", param="model"
+            f"Model {req.model!r} is not found", param="model"
         )
     _validate_image_n(req.model, req.n or 1, param="n")
 
+    # ── Console (X 免费账号) image generation ───────────────────────────────
+    if spec.is_console_image():
+        from .console_images import generate as console_img_gen
+        result = await console_img_gen(
+            model=req.model,
+            prompt=req.prompt,
+            n=req.n or 1,
+            size=req.size or "1024x1024",
+            response_format=req.response_format or "url",
+        )
+        return JSONResponse(result)
+
+    # ── grok.com WebSocket image generation (existing) ──────────────────────
+    if not spec.is_image():
+        raise ValidationError(
+            f"Model {req.model!r} is not an image model", param="model"
+        )
     from .images import generate as img_gen
 
     result = await img_gen(

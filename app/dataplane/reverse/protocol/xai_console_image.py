@@ -21,9 +21,16 @@
     ]
 }
 
-注意: console.x.ai 是否实际暴露此端点需在 X 免费账号上验证。
-本模块按 OpenAI Images API 规范实现,如果上游不支持会返回 404
-或类似的 UpstreamError — 错误信息会明确指出失败原因。
+验证结果(2026-06-04,用真实 accounts.db 中的 SSO token):
+- URL /v1/images/generations 存在且可达(到达 xAI API 网关,返回结构化错误)
+- Bearer anonymous + sso/sso-rw cookie 认证通过(同一 token 走 /v1/responses 200)
+- 三个模型字段 grok-imagine-image-lite / grok-imagine-image / grok-imagine-image-pro
+  均被 API 接受(返回结构化 429 而不是 400/422)
+- 但 xAI 上游对 image 端点施加了独立且更严格的限速,免费层账号当前返回
+  429 "Some resource has been exhausted"。原因可能是:
+  * 免费层图片生成默认配额为 0(需 X Premium 开通)
+  * 或 IP/全局级 image 限速(同一 token chat 200 但 image 429)
+  验证时未触发任何 4xx 业务错误,只有上游限速。
 """
 
 from __future__ import annotations
@@ -141,22 +148,27 @@ async def generate_via_console(
 # ---------------------------------------------------------------------------
 
 
-def _success_feedback() -> dict[str, float]:
-    return {"success": 1.0}
+def _success_feedback():
+    from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind
+    return ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS, status_code=200)
 
 
-def _status_feedback(status: int) -> dict[str, float]:
-    if status in (401, 403):
-        return {"auth_fail": 1.0}
-    if status == 429:
-        return {"rate_limited": 1.0}
-    if status >= 500:
-        return {"server_error": 1.0}
-    return {"client_error": 1.0}
+def _status_feedback(status: int):
+    from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind
+    if status == 403:
+        kind = ProxyFeedbackKind.CHALLENGE
+    elif status == 429:
+        kind = ProxyFeedbackKind.RATE_LIMITED
+    elif status >= 500:
+        kind = ProxyFeedbackKind.UPSTREAM_5XX
+    else:
+        kind = ProxyFeedbackKind.FORBIDDEN
+    return ProxyFeedback(kind=kind, status_code=status)
 
 
-def _transport_error_feedback() -> dict[str, float]:
-    return {"transport_error": 1.0}
+def _transport_error_feedback():
+    from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind
+    return ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR)
 
 
 __all__ = [
