@@ -202,6 +202,14 @@ async def lifespan(app: FastAPI):
     set_refresh_service(refresh_svc)
     app.state.refresh_service = refresh_svc
 
+    usage_concurrency = _config.get_int("account.refresh.usage_concurrency", 50)
+    if usage_concurrency > 20:
+        logger.warning(
+            "account.refresh.usage_concurrency={} > 20 — residential/cellular "
+            "uplinks will saturate; reduce to 5-10 unless running on dedicated IP",
+            usage_concurrency,
+        )
+
     is_leader = _try_acquire_scheduler_lock()
     scheduler = get_account_refresh_scheduler(refresh_svc)
     set_refresh_scheduler(scheduler)

@@ -53,3 +53,9 @@ htmlcov/
 
 # Project specific
 .ace-tool/
+
+# Test fixtures — sensitive credentials, do NOT commit
+sso.txt
+*.sso.txt
+test_sso*.txt
+tokens_*.txt
