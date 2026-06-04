@@ -69,6 +69,9 @@ class AccountRefreshService:
         self._lock = asyncio.Lock()
         self._od_lock = asyncio.Lock()
         self._od_last = 0.0
+        # Per-token throttle for refresh_token_only. Key: token, value: monotonic ts.
+        # Prevents one token from triggering N upstream probes within the throttle window.
+        self._od_last_token: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Usage API fetch (delegates to dataplane reverse protocol)
@@ -214,6 +217,40 @@ class AccountRefreshService:
                 return RefreshResult()
             result = await self.refresh_scheduled()
             self._od_last = time.monotonic()
+            return result
+
+    async def refresh_token_only(self, token: str, pool: str | None = None) -> RefreshResult:
+        """Refresh a single token — used by the 429 hot-path so a single failure
+        never cascades into a full account-pool refresh.
+
+        Per-token throttle defaults to ``on_demand_min_interval_sec`` (300s) to
+        match the legacy bulk throttle; override via the second positional arg
+        in seconds when needed for testing.
+        """
+        import time
+
+        min_interval = float(
+            get_config("account.refresh.on_demand_min_interval_sec", 300)
+        )
+        now = time.monotonic()
+        last = self._od_last_token.get(token, 0.0)
+        if now - last < min_interval:
+            return RefreshResult()
+
+        records = await self._repo.get_accounts([token])
+        if not records:
+            return RefreshResult()
+        record = records[0]
+        if record.is_deleted() or not is_manageable(record):
+            return RefreshResult()
+
+        async with self._od_lock:
+            # Re-check throttle inside the lock to avoid stampedes.
+            now = time.monotonic()
+            if now - self._od_last_token.get(token, 0.0) < min_interval:
+                return RefreshResult()
+            result = await self._refresh_one(record, apply_fallback=False)
+            self._od_last_token[token] = time.monotonic()
             return result
 
     async def refresh_tokens(self, tokens: list[str]) -> RefreshResult:

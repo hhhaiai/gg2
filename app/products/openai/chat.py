@@ -130,6 +130,10 @@ async def _fail_sync(
     In random mode this helper must not trigger upstream quota probes. It still
     records failures so 401 invalidation and local failure accounting continue
     to work unchanged.
+
+    On 429 (quota mode) we refresh only the failing token — refreshing the
+    whole pool would saturate the residential uplink when many tokens 429 at
+    once. See AccountRefreshService.refresh_token_only.
     """
     try:
         svc = get_refresh_service()
@@ -139,9 +143,10 @@ async def _fail_sync(
                 current_strategy() == "quota"
                 and getattr(exc, "status", None) == 429
             ):
-                result = await svc.refresh_on_demand()
+                result = await svc.refresh_token_only(token)
                 logger.info(
-                    "account on-demand refresh triggered: token={}... mode_id={} refreshed={} failed={} rate_limited={}",
+                    "account on-demand single-token refresh: token={}... mode_id={} "
+                    "refreshed={} failed={} rate_limited={}",
                     token[:10],
                     mode_id,
                     result.refreshed,
