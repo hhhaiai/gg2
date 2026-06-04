@@ -7,9 +7,6 @@ X 免费账号走 console.x.ai 的 OpenAI Images API 兼容端点,
 """
 
 import asyncio
-from typing import Any
-
-import orjson
 
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
