@@ -15,6 +15,7 @@ import asyncio
 import os
 import platform
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -250,6 +251,15 @@ async def lifespan(app: FastAPI):
     proxy_scheduler = ProxyClearanceScheduler(proxy_dir)
     if is_leader:
         proxy_scheduler.start()
+
+    # 6. Pre-warm tiktoken encoding — first request would otherwise spend ~200ms
+    # loading the BPE table from disk. Run in a thread to avoid blocking the loop.
+    from app.platform.tokens import _get_encoding
+
+    warm_start = time.perf_counter()
+    await asyncio.to_thread(_get_encoding)
+    logger.debug("tiktoken pre-warm: encoding={} took_ms={}",
+                 "o200k_base", int((time.perf_counter() - warm_start) * 1000))
 
     logger.info("application startup completed")
     yield
