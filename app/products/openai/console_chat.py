@@ -42,41 +42,18 @@ from ._format import (
 
 
 def _log_task_exception(task: "asyncio.Task") -> None:
-    exc = task.exception() if not task.cancelled() else None
-    if exc:
-        logger.warning("background task failed: task={} error={}", task.get_name(), exc)
+    from app.products._console_helpers import log_task_exception
+    log_task_exception(task, label="console chat")
 
 
 async def _quota_sync(token: str, mode_id: int) -> None:
-    """Fire-and-forget: 成功调用后持久化配额扣减和 usage_use_count。"""
-    try:
-        if current_strategy() != "quota":
-            return
-        svc = get_refresh_service()
-        if svc:
-            await svc.refresh_call_async(token, mode_id)
-    except Exception as exc:
-        logger.warning(
-            "console quota sync failed: token={}... mode_id={} error={}",
-            token[:10],
-            mode_id,
-            exc,
-        )
+    from app.products._console_helpers import quota_sync as _quota_sync_impl
+    await _quota_sync_impl(token, mode_id, label="console chat")
 
 
 async def _fail_sync(token: str, mode_id: int, exc: BaseException | None = None) -> None:
-    """Fire-and-forget: 失败后持久化失败计数。"""
-    try:
-        svc = get_refresh_service()
-        if svc:
-            await svc.record_failure_async(token, mode_id, exc)
-    except Exception as e:
-        logger.warning(
-            "console fail sync error: token={}... mode_id={} error={}",
-            token[:10],
-            mode_id,
-            e,
-        )
+    from app.products._console_helpers import fail_sync as _fail_sync_impl
+    await _fail_sync_impl(token, mode_id, exc, label="console chat")
 
 
 def _reasoning_effort_from_emit_think(emit_think: bool | None) -> str:
