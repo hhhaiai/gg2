@@ -202,6 +202,10 @@ async def lifespan(app: FastAPI):
     refresh_svc = AccountRefreshService(repo)
     set_refresh_service(refresh_svc)
     app.state.refresh_service = refresh_svc
+    # Sentinel for the per-request middleware: force the first request to
+    # run reconcile_refresh_runtime once, then skip until config version
+    # changes again.
+    app.state.config_reconciled_version = object()
 
     usage_concurrency = _config.get_int("account.refresh.usage_concurrency", 50)
     if usage_concurrency > 20:
@@ -363,13 +367,19 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Ensure config is loaded on every request.
+    # Ensure config is loaded on every request. reconcile_refresh_runtime is
+    # only invoked when the config version actually changed (rare); the hot
+    # path just touches _config.load() (which is itself a stat-only fast path)
+    # and skips the strategy/scheduler reconcile entirely.
     @app.middleware("http")
     async def _ensure_config(request: Request, call_next):
         from app.control.account.runtime import reconcile_refresh_runtime
 
         await _config.load()
-        reconcile_refresh_runtime()
+        ver = _config._version
+        if ver != app.state.config_reconciled_version:
+            reconcile_refresh_runtime()
+            app.state.config_reconciled_version = ver
         return await call_next(request)
 
     # Global exception handler — converts AppError to JSON.
