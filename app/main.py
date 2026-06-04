@@ -211,6 +211,9 @@ async def lifespan(app: FastAPI):
             usage_concurrency,
         )
 
+    # Start the failure coalescer (batches record_failure_async writes).
+    await refresh_svc.start_failure_coalescer()
+
     is_leader = _try_acquire_scheduler_lock()
     scheduler = get_account_refresh_scheduler(refresh_svc)
     set_refresh_scheduler(scheduler)
@@ -268,6 +271,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     # -----------
     logger.info("application shutdown started")
+    # Drain pending failure writes first so the in-memory buffer doesn't lose data.
+    await refresh_svc.stop_failure_coalescer()
     sync_task.cancel()
     try:
         await sync_task

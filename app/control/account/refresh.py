@@ -72,6 +72,10 @@ class AccountRefreshService:
         # Per-token throttle for refresh_token_only. Key: token, value: monotonic ts.
         # Prevents one token from triggering N upstream probes within the throttle window.
         self._od_last_token: dict[str, float] = {}
+        # Failure coalescer: groups rapid record_failure_async calls into a single
+        # batched DB write. Without this, 100 RPS * 5% error = 5 UPDATE/s; with it,
+        # bursty errors collapse into one UPDATE per coalesce window.
+        self._fail_coalescer = _FailureCoalescer(repository)
 
     # ------------------------------------------------------------------
     # Usage API fetch (delegates to dataplane reverse protocol)
@@ -253,6 +257,24 @@ class AccountRefreshService:
             self._od_last_token[token] = time.monotonic()
             return result
 
+    # ------------------------------------------------------------------
+    # Failure coalescer lifecycle
+    # ------------------------------------------------------------------
+
+    async def start_failure_coalescer(self) -> None:
+        """Start the background flush task for coalesced failure writes.
+
+        Idempotent — safe to call from lifespan startup.
+        """
+        await self._fail_coalescer.start()
+
+    async def stop_failure_coalescer(self) -> None:
+        """Stop the flush task and drain pending failures.
+
+        Idempotent — safe to call from lifespan shutdown.
+        """
+        await self._fail_coalescer.stop()
+
     async def refresh_tokens(self, tokens: list[str]) -> RefreshResult:
         """Explicit refresh for a list of tokens (admin / manual trigger)."""
         records = [r for r in await self._repo.get_accounts(tokens) if is_manageable(r)]
@@ -417,65 +439,14 @@ class AccountRefreshService:
     async def record_failure_async(
         self, token: str, mode_id: int, exc: BaseException | None = None
     ) -> None:
-        """Fire-and-forget: persist failure counter and timestamp after a failed call."""
-        from .commands import AccountPatch
+        """Fire-and-forget: persist failure counter and timestamp after a failed call.
 
-        try:
-            if exc is not None:
-                record = next(iter(await self._repo.get_accounts([token])), None)
-                if record is not None and await self._expire_invalid_credentials(
-                    record, exc
-                ):
-                    return
-                if (
-                    record is not None
-                    and getattr(exc, "status", None) == 429
-                    and mode_id in _MODE_KEYS
-                ):
-                    now = now_ms()
-                    quota_patch: dict[str, dict] = {}
-                    window = record.quota_set().get(mode_id)
-                    if window is not None:
-                        reset_at = (
-                            window.reset_at
-                            if window.reset_at is not None and window.reset_at > now
-                            else now + max(window.window_seconds, 1) * 1000
-                        )
-                        quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
-                            remaining=0,
-                            total=window.total,
-                            window_seconds=window.window_seconds,
-                            reset_at=reset_at,
-                            synced_at=window.synced_at,
-                            source=QuotaSource.ESTIMATED,
-                        ).to_dict()
-                    await self._repo.patch_accounts(
-                        [
-                            AccountPatch(
-                                token=token,
-                                usage_fail_delta=1,
-                                last_fail_at=now,
-                                last_fail_reason="rate_limited",
-                                **quota_patch,
-                            )
-                        ]
-                    )
-                    return
-            await self._repo.patch_accounts(
-                [
-                    AccountPatch(
-                        token=token,
-                        usage_fail_delta=1,
-                        last_fail_at=now_ms(),
-                    )
-                ]
-            )
-        except Exception as exc:
-            logger.debug(
-                "account failure record update failed: token={}... error={}",
-                token[:10],
-                exc,
-            )
+        Implementation: enqueues a (token, mode_id, exc) event into the
+        _FailureCoalescer, which batches events that occur within a short
+        window into a single ``patch_accounts`` call. The hot path no longer
+        performs a SELECT + UPDATE per failure event.
+        """
+        await self._fail_coalescer.enqueue(token, mode_id, exc)
 
     async def _apply_single_mode(
         self,
@@ -572,6 +543,160 @@ class AccountRefreshService:
             exc,
             source="usage refresh",
         )
+
+
+# ---------------------------------------------------------------------------
+# Failure coalescer
+# ---------------------------------------------------------------------------
+
+
+class _FailureCoalescer:
+    """Coalesce rapid ``record_failure_async`` events into batched DB writes.
+
+    Without this, every failed request issues its own SELECT (to read the
+    current quota window for 429 quota-reset) + UPDATE. At 100 RPS * 5% error
+    that's 10 DB ops/s. Under a 100% upstream outage it scales to hundreds
+    per second and overwhelms WAL / Redis Cluster.
+
+    Coalescing strategy:
+      - Per (token, mode_id) keep one pending entry.
+      - On every enqueue, increment counters and remember the latest event ts.
+      - A background task flushes the buffer every ``flush_interval_sec``;
+        flushed entries are merged into a single ``patch_accounts`` call
+        (one entry per token+mode after merge).
+      - The 429 quota-reset path is also coalesced — the quota patch is
+        computed on the first event for a (token, mode) and reused, since
+        the resulting state (remaining=0, reset_at=now+window) is identical
+        across rapid duplicate failures.
+    """
+
+    def __init__(
+        self,
+        repository: "AccountRepository",
+        *,
+        flush_interval_sec: float = 1.0,
+    ) -> None:
+        self._repo = repository
+        self._flush_interval = flush_interval_sec
+        # Key: (token, mode_id). Value: dict with merged fields.
+        self._pending: dict[tuple[str, int], dict] = {}
+        self._lock = asyncio.Lock()
+        self._task: asyncio.Task | None = None
+        self._stopping = False
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stopping = False
+        self._task = asyncio.create_task(self._run(), name="failure-coalescer")
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        await self._flush()
+
+    async def enqueue(
+        self, token: str, mode_id: int, exc: BaseException | None
+    ) -> None:
+        try:
+            status = getattr(exc, "status", None)
+            async with self._lock:
+                key = (token, mode_id)
+                entry = self._pending.get(key)
+                if entry is None:
+                    entry = {
+                        "fail_delta": 0,
+                        "last_fail_at": 0,
+                        "last_fail_reason": None,
+                        "is_429": False,
+                        "quota_patch": None,
+                    }
+                    self._pending[key] = entry
+                entry["fail_delta"] += 1
+                now = now_ms()
+                entry["last_fail_at"] = max(entry["last_fail_at"], now)
+                if status == 429:
+                    entry["is_429"] = True
+                    entry["last_fail_reason"] = "rate_limited"
+                elif entry["last_fail_reason"] is None and status is not None:
+                    entry["last_fail_reason"] = f"http_{int(status)}"
+        except Exception as e:
+            logger.debug("failure coalescer enqueue error: token={}... err={}", token[:10], e)
+
+    async def _run(self) -> None:
+        while not self._stopping:
+            try:
+                await asyncio.sleep(self._flush_interval)
+            except asyncio.CancelledError:
+                return
+            try:
+                await self._flush()
+            except Exception as e:
+                logger.debug("failure coalescer flush error: {}", e)
+
+    async def _flush(self) -> None:
+        async with self._lock:
+            if not self._pending:
+                return
+            pending = self._pending
+            self._pending = {}
+
+        # For 429 entries we still need the current quota window to compute the
+        # reset_at. Batch-fetch only the tokens we need, then build patches.
+        tokens_429 = {t for (t, _m), e in pending.items() if e["is_429"]}
+        quota_by_token: dict[str, "AccountRecord"] = {}
+        if tokens_429:
+            try:
+                records = await self._repo.get_accounts(list(tokens_429))
+                quota_by_token = {r.token: r for r in records}
+            except Exception as e:
+                logger.debug("failure coalescer quota fetch error: {}", e)
+
+        from .commands import AccountPatch
+
+        patches: list[AccountPatch] = []
+        for (token, mode_id), entry in pending.items():
+            quota_patch: dict[str, dict] = {}
+            if entry["is_429"] and mode_id in _MODE_KEYS:
+                record = quota_by_token.get(token)
+                if record is not None:
+                    now = now_ms()
+                    window = record.quota_set().get(mode_id)
+                    if window is not None:
+                        reset_at = (
+                            window.reset_at
+                            if window.reset_at is not None and window.reset_at > now
+                            else now + max(window.window_seconds, 1) * 1000
+                        )
+                        quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
+                            remaining=0,
+                            total=window.total,
+                            window_seconds=window.window_seconds,
+                            reset_at=reset_at,
+                            synced_at=window.synced_at,
+                            source=QuotaSource.ESTIMATED,
+                        ).to_dict()
+            patches.append(
+                AccountPatch(
+                    token=token,
+                    usage_fail_delta=entry["fail_delta"],
+                    last_fail_at=entry["last_fail_at"],
+                    last_fail_reason=entry["last_fail_reason"],
+                    **quota_patch,
+                )
+            )
+
+        if patches:
+            try:
+                await self._repo.patch_accounts(patches)
+            except Exception as e:
+                logger.debug("failure coalescer patch write error: {}", e)
 
 
 __all__ = ["AccountRefreshService", "RefreshResult"]
