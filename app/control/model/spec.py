@@ -51,6 +51,10 @@ class ModelSpec:
         """通过 console.x.ai/v1/responses 路由的模型。"""
         return bool(self.capability & Capability.CONSOLE_CHAT)
 
+    def is_console_image(self) -> bool:
+        """通过 console.x.ai/v1/images/generations 路由的图像生成。"""
+        return bool(self.capability & Capability.CONSOLE_IMAGE)
+
     def pool_name(self) -> str:
         """Return the canonical pool string for this tier."""
         if self.tier == Tier.SUPER:

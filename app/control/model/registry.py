@@ -70,6 +70,12 @@ MODELS: tuple[ModelSpec, ...] = (
     ModelSpec("grok-4.20-multi-agent-xhigh",            ModeId.CONSOLE,  Tier.BASIC, Capability.CONSOLE_CHAT, True, "Grok 4.20 Multi-Agent XHigh"),
     ModelSpec("grok-4.20-0309-non-reasoning-console",   ModeId.CONSOLE,  Tier.BASIC, Capability.CONSOLE_CHAT, True, "Grok 4.20 0309 Non-Reasoning (Console)"),
     ModelSpec("grok-build-console",                     ModeId.CONSOLE,  Tier.BASIC, Capability.CONSOLE_CHAT, True, "Grok Build 0.1 (Console)"),
+
+    # === Console Image (console.x.ai/v1/images/generations) ==================
+    # X 免费账号可用;走 console API 独立配额 (30/15min, see quota_defaults.BASIC_CONSOLE_LIMIT)
+    ModelSpec("grok-imagine-image-lite-console",        ModeId.CONSOLE,  Tier.BASIC, Capability.CONSOLE_IMAGE, True, "Grok Imagine Image Lite (Console)"),
+    ModelSpec("grok-imagine-image-console",             ModeId.CONSOLE,  Tier.BASIC, Capability.CONSOLE_IMAGE, True, "Grok Imagine Image (Console)"),
+    ModelSpec("grok-imagine-image-pro-console",         ModeId.CONSOLE,  Tier.BASIC, Capability.CONSOLE_IMAGE, True, "Grok Imagine Image Pro (Console)"),
 )
 # fmt: on
 

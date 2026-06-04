@@ -41,6 +41,8 @@ class Capability(IntFlag):
     VOICE = 16
     ASSET = 32
     CONSOLE_CHAT = 64  # 通过 console.x.ai/v1/responses 路由
+    # 通过 console.x.ai/v1/images/generations 路由的图像生成(X 免费账号可用)
+    CONSOLE_IMAGE = 128
 
 
 # Human-readable mode strings in API order.
