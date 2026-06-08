@@ -59,3 +59,4 @@ sso.txt
 *.sso.txt
 test_sso*.txt
 tokens_*.txt
+.omx/

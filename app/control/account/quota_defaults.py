@@ -2,10 +2,10 @@
 
 Canonical quota totals per pool type (from upstream rate-limits API):
 
-              auto    fast    expert    heavy    grok_4_3
-  basic          —      30       —        —         —        window: 86400 s
-  super         50     140      50        —        50        window: 7200 s
-  heavy        150     400     150       20       150        window: 7200 s
+              auto    fast    expert    heavy    grok_4_3   console
+  basic          —      30       —        —         —          30/15m
+  super         50     140      50        —        50          30/15m
+  heavy        150     400     150       20       150          30/15m
 
 Pool inference uses ``auto.total`` as the primary signal for super/heavy
 accounts; basic accounts no longer expose auto/expert windows locally.
@@ -58,6 +58,7 @@ SUPER_QUOTA_DEFAULTS = AccountQuotaSet(
     fast=_w(140, 140, 7_200),  # 140 queries / 2 h
     expert=_w(50, 50, 7_200),  # 50  queries / 2 h
     grok_4_3=_w(50, 50, 7_200),  # 50  queries / 2 h
+    console=_w(BASIC_CONSOLE_LIMIT, BASIC_CONSOLE_LIMIT, BASIC_CONSOLE_WINDOW_SECONDS),
 )
 
 HEAVY_QUOTA_DEFAULTS = AccountQuotaSet(
@@ -66,6 +67,7 @@ HEAVY_QUOTA_DEFAULTS = AccountQuotaSet(
     expert=_w(150, 150, 7_200),  # 150 queries / 2 h
     heavy=_w(20, 20, 7_200),  # 20  queries / 2 h
     grok_4_3=_w(150, 150, 7_200),  # 150 queries / 2 h
+    console=_w(BASIC_CONSOLE_LIMIT, BASIC_CONSOLE_LIMIT, BASIC_CONSOLE_WINDOW_SECONDS),
 )
 
 # Map pool name → defaults object (used by backends on upsert).

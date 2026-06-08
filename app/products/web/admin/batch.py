@@ -20,6 +20,7 @@ from app.platform.errors import AppError, ErrorKind, UpstreamError, ValidationEr
 from app.platform.runtime.batch import run_batch
 from app.platform.runtime.task import create_task, expire_task, get_task
 from app.control.account.commands import AccountPatch, ListAccountsQuery
+from app.control.account.enums import AccountStatus
 from app.control.account.state_machine import is_manageable
 
 if TYPE_CHECKING:
@@ -55,6 +56,28 @@ async def _list_all_tokens(repo: "AccountRepository") -> list[str]:
             break
         page_num += 1
     return tokens
+
+
+async def _list_expired_tokens(
+    repo: "AccountRepository",
+    *,
+    limit: int,
+) -> list[str]:
+    page_num, tokens = 1, []
+    page_size = min(max(limit, 1), 2000)
+    while len(tokens) < limit:
+        page = await repo.list_accounts(
+            ListAccountsQuery(
+                page=page_num,
+                page_size=page_size,
+                status=AccountStatus.EXPIRED,
+            )
+        )
+        tokens.extend(r.token for r in page.items)
+        if page_num >= page.total_pages:
+            break
+        page_num += 1
+    return tokens[:limit]
 
 
 def _json(data: Any, status_code: int = 200) -> Response:
@@ -252,6 +275,48 @@ async def batch_refresh(
 
     c = _concurrency(concurrency, "batch.refresh_concurrency")
     return await _dispatch(tokens, _refresh_one, use_async=async_mode, concurrency=c)
+
+
+@router.post("/revive-expired")
+async def batch_revive_expired(
+    req: BatchRequest,
+    async_mode: bool = Query(True, alias="async"),
+    concurrency: int | None = Query(2, ge=1, le=10),
+    limit: int = Query(100, ge=1, le=2000),
+    repo: "AccountRepository" = Depends(get_repo),
+    refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
+):
+    """Conservatively re-check expired accounts and restore only real successes.
+
+    Empty ``tokens`` means "take the first N expired accounts", controlled by
+    ``limit``.  The handler never blindly flips status to active; it requires
+    live quota data from the upstream usage endpoint.
+    """
+    tokens = [t.strip() for t in req.tokens if t.strip()]
+    if not tokens:
+        tokens = await _list_expired_tokens(repo, limit=limit)
+    if not tokens:
+        raise ValidationError("No expired tokens available", param="tokens")
+
+    async def _revive_one(token: str) -> dict:
+        result = await refresh_svc.revive_expired_tokens(
+            [token],
+            concurrency=1,
+        )
+        if not result.recovered:
+            raise UpstreamError("账号仍不可用，未恢复为 active")
+        return {
+            "checked": result.checked,
+            "refreshed": result.refreshed,
+            "recovered": result.recovered,
+        }
+
+    return await _dispatch(
+        tokens,
+        _revive_one,
+        use_async=async_mode,
+        concurrency=max(1, min(int(concurrency or 2), 10)),
+    )
 
 
 @router.post("/cache-clear")

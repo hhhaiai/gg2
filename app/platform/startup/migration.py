@@ -54,9 +54,205 @@ async def run_startup_migrations(
     await _migrate_config(config_backend)
     await _migrate_basic_refresh_interval(config_backend)
     await _migrate_accounts(account_repo)
+
+    if await _try_fast_local_sqlite_quota_migrations():
+        return
+
     await _backfill_grok_4_3_quota(account_repo)
     await _normalize_basic_fast_only_quota(account_repo)
     await _backfill_console_quota(account_repo)
+
+
+async def _try_fast_local_sqlite_quota_migrations() -> bool:
+    """Run quota backfills directly in SQLite for the configured local backend.
+
+    The generic repository path pages through every account multiple times.
+    With large local databases that keeps the ASGI lifespan open for minutes,
+    so the container is "running" but not listening.  SQLite can perform the
+    same missing-quota backfills in a few UPDATE statements.
+
+    Return True when the local fast path handled the quota migrations and the
+    slower repository scans should be skipped.  Return False for non-local
+    backends or unknown schema so those backends keep using repository-level
+    migrations.
+    """
+    from app.control.account.backends.factory import describe_repository_target, get_repository_backend
+
+    if get_repository_backend() != "local":
+        return False
+
+    _, target = describe_repository_target()
+    db_path = Path(target)
+    if not db_path.exists():
+        return True
+
+    def _sync() -> bool:
+        import json
+        import sqlite3
+
+        from app.control.account.quota_defaults import default_quota_set, default_quota_window
+
+        basic_defaults = default_quota_set("basic")
+        zero = json.dumps(basic_defaults.auto.to_dict())
+        basic_fast = json.dumps(basic_defaults.fast.to_dict())
+        basic_expert = json.dumps(basic_defaults.expert.to_dict())
+        console = json.dumps(default_quota_window("basic", 5).to_dict())
+        super43 = json.dumps(default_quota_window("super", 4).to_dict())
+        heavy43 = json.dumps(default_quota_window("heavy", 4).to_dict())
+
+        with sqlite3.connect(str(db_path), timeout=30.0) as conn:
+            cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+            }
+            required = {"quota_auto", "quota_fast", "quota_expert", "quota_grok_4_3", "quota_console"}
+            if not required.issubset(cols):
+                return False
+
+            before_basic = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM accounts
+                WHERE deleted_at IS NULL
+                  AND pool = 'basic'
+                  AND (
+                    quota_auto NOT IN ('{}', ?)
+                    OR quota_expert NOT IN ('{}', ?)
+                    OR quota_fast = '{}'
+                    OR quota_fast IS NULL
+                    OR quota_fast = ''
+                    OR NOT json_valid(quota_fast)
+                    OR (
+                        json_valid(quota_fast)
+                        AND (
+                            COALESCE(json_extract(quota_fast, '$.total'), -1) != 30
+                            OR COALESCE(json_extract(quota_fast, '$.window_seconds'), -1) != 86400
+                            OR COALESCE(json_extract(quota_fast, '$.remaining'), 999999) > 30
+                        )
+                    )
+                  )
+                """,
+                (zero, basic_expert),
+            ).fetchone()[0]
+
+            before_console = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM accounts
+                WHERE deleted_at IS NULL
+                  AND (quota_console = '{}' OR quota_console IS NULL OR quota_console = '')
+                """
+            ).fetchone()[0]
+
+            before_grok43 = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM accounts
+                WHERE deleted_at IS NULL
+                  AND pool IN ('super', 'heavy')
+                  AND (quota_grok_4_3 = '{}' OR quota_grok_4_3 IS NULL OR quota_grok_4_3 = '')
+                """
+            ).fetchone()[0]
+
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE accounts
+                SET quota_auto = ?,
+                    quota_expert = ?
+                WHERE deleted_at IS NULL
+                  AND pool = 'basic'
+                  AND (quota_auto NOT IN ('{}', ?) OR quota_expert NOT IN ('{}', ?))
+                """,
+                (zero, basic_expert, zero, basic_expert),
+            )
+            conn.execute(
+                """
+                UPDATE accounts
+                SET quota_fast = json_set(
+                    CASE
+                      WHEN json_valid(quota_fast) AND quota_fast != '{}' THEN quota_fast
+                      ELSE ?
+                    END,
+                    '$.remaining',
+                    min(
+                        max(
+                            CASE
+                              WHEN json_valid(quota_fast)
+                              THEN COALESCE(json_extract(quota_fast, '$.remaining'), 30)
+                              ELSE 30
+                            END,
+                            0
+                        ),
+                        30
+                    ),
+                    '$.total',
+                    30,
+                    '$.window_seconds',
+                    86400
+                )
+                WHERE deleted_at IS NULL
+                  AND pool = 'basic'
+                  AND (
+                    quota_fast = '{}'
+                    OR quota_fast IS NULL
+                    OR quota_fast = ''
+                    OR NOT json_valid(quota_fast)
+                    OR (
+                        json_valid(quota_fast)
+                        AND (
+                            COALESCE(json_extract(quota_fast, '$.total'), -1) != 30
+                            OR COALESCE(json_extract(quota_fast, '$.window_seconds'), -1) != 86400
+                            OR COALESCE(json_extract(quota_fast, '$.remaining'), 999999) > 30
+                        )
+                    )
+                  )
+                """,
+                (basic_fast,),
+            )
+            conn.execute(
+                """
+                UPDATE accounts
+                SET quota_console = ?
+                WHERE deleted_at IS NULL
+                  AND (quota_console = '{}' OR quota_console IS NULL OR quota_console = '')
+                """,
+                (console,),
+            )
+            conn.execute(
+                """
+                UPDATE accounts
+                SET quota_grok_4_3 = ?
+                WHERE deleted_at IS NULL
+                  AND pool = 'super'
+                  AND (quota_grok_4_3 = '{}' OR quota_grok_4_3 IS NULL OR quota_grok_4_3 = '')
+                """,
+                (super43,),
+            )
+            conn.execute(
+                """
+                UPDATE accounts
+                SET quota_grok_4_3 = ?
+                WHERE deleted_at IS NULL
+                  AND pool = 'heavy'
+                  AND (quota_grok_4_3 = '{}' OR quota_grok_4_3 IS NULL OR quota_grok_4_3 = '')
+                """,
+                (heavy43,),
+            )
+            conn.commit()
+
+        if before_basic or before_console or before_grok43:
+            logger.info(
+                "account: fast local quota migration completed: basic={} console={} grok_4_3={}",
+                before_basic,
+                before_console,
+                before_grok43,
+            )
+        else:
+            logger.debug("account: fast local quota migration skipped; already current")
+        return True
+
+    return await asyncio.to_thread(_sync)
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,6 @@ Performance notes:
 """
 
 import asyncio
-import re
 from typing import TYPE_CHECKING
 
 import orjson
@@ -19,6 +18,7 @@ from pydantic import BaseModel, RootModel
 from app.platform.errors import AppError, ErrorKind, ValidationError
 from app.platform.logging.logger import logger
 from app.platform.runtime.clock import now_ms
+from app.platform.text.sanitize import sanitize_token as _sanitize
 from app.control.account.commands import (
     AccountPatch,
     AccountUpsert,
@@ -34,13 +34,8 @@ if TYPE_CHECKING:
 from . import get_refresh_svc, get_repo
 
 router = APIRouter(tags=["Admin - Tokens"])
-
-# ---------------------------------------------------------------------------
-# Token sanitisation
-# ---------------------------------------------------------------------------
-
-from app.platform.text.sanitize import sanitize_token as _sanitize
-
+_PAGE_SIZE_MAX = 2000
+_ACCOUNT_BATCH_SIZE = 500
 
 def _mask(token: str) -> str:
     return f"{token[:8]}...{token[-8:]}" if len(token) > 20 else token
@@ -121,6 +116,49 @@ def _json(data) -> Response:
     return Response(content=orjson.dumps(data), media_type="application/json")
 
 
+def _chunks(items: list, size: int = _ACCOUNT_BATCH_SIZE):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+async def _get_accounts_batched(
+    repo: "AccountRepository",
+    tokens: list[str],
+    *,
+    batch_size: int = _ACCOUNT_BATCH_SIZE,
+):
+    records = []
+    for batch in _chunks(tokens, batch_size):
+        records.extend(await repo.get_accounts(batch))
+    return records
+
+
+async def _upsert_accounts_batched(
+    repo: "AccountRepository",
+    upserts: list[AccountUpsert],
+    *,
+    batch_size: int = _ACCOUNT_BATCH_SIZE,
+) -> int:
+    total = 0
+    for batch in _chunks(upserts, batch_size):
+        result = await repo.upsert_accounts(batch)
+        total += result.upserted or len(batch)
+    return total
+
+
+async def _patch_accounts_batched(
+    repo: "AccountRepository",
+    patches: list[AccountPatch],
+    *,
+    batch_size: int = _ACCOUNT_BATCH_SIZE,
+) -> int:
+    total = 0
+    for batch in _chunks(patches, batch_size):
+        result = await repo.patch_accounts(batch)
+        total += result.patched
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -136,7 +174,7 @@ async def list_tokens(
 ):
     """Return a paginated token list.
 
-    Defaults: page=1, page_size=50 (max 200). Optional filters: pool,
+    Defaults: page=1, page_size=50 (max 2000). Optional filters: pool,
     status, q (substring match against token prefix).
 
     The previous implementation looped ALL pages and returned every row
@@ -157,7 +195,7 @@ async def list_tokens(
     """
     query = ListAccountsQuery(
         page=page,
-        page_size=min(max(page_size, 1), 200),
+        page_size=min(max(page_size, 1), _PAGE_SIZE_MAX),
         pool=pool,
         status=AccountStatus(status) if status else None,
     )
@@ -216,7 +254,7 @@ async def save_tokens(
 
     # Single DB roundtrip: classify each requested token as already-active,
     # soft-deleted (will be restored by upsert), or brand-new.
-    existing_records = await repo.get_accounts([u.token for u in upserts])
+    existing_records = await _get_accounts_batched(repo, [u.token for u in upserts])
     existing_active: set[str] = set()
     existing_soft_deleted: set[str] = set()
     for r in existing_records:
@@ -230,7 +268,7 @@ async def save_tokens(
     restored = sum(1 for u in new_upserts if u.token in existing_soft_deleted)
 
     if new_upserts:
-        await repo.upsert_accounts(new_upserts)
+        await _upsert_accounts_batched(repo, new_upserts)
 
     logger.info(
         "admin tokens imported (additive): total_requested={} added={} skipped={} restored={}",
@@ -269,14 +307,18 @@ async def add_tokens(
 
     # Only upsert tokens that are not already active — avoids overwriting quota/status.
     # Soft-deleted tokens are treated as non-existing so they can be restored.
-    existing = {r.token for r in await repo.get_accounts(cleaned) if not r.is_deleted()}
+    existing = {
+        r.token
+        for r in await _get_accounts_batched(repo, cleaned)
+        if not r.is_deleted()
+    }
     new_tokens = [t for t in cleaned if t not in existing]
 
     if not new_tokens:
         return _json({"status": "success", "count": 0, "skipped": len(cleaned)})
 
     upserts = [AccountUpsert(token=t, pool=requested_pool, tags=req.tags) for t in new_tokens]
-    result = await repo.upsert_accounts(upserts)
+    upserted = await _upsert_accounts_batched(repo, upserts)
     logger.info(
         "admin tokens added: pool={} added_count={} skipped_count={}",
         requested_pool,
@@ -298,7 +340,7 @@ async def add_tokens(
 
     return _json({
         "status": "success",
-        "count": result.upserted or len(new_tokens),
+        "count": upserted or len(new_tokens),
         "skipped": len(existing),
         "synced": sync_auto_detect,
     })
@@ -442,7 +484,7 @@ async def toggle_tokens_disabled(
     if not cleaned:
         raise ValidationError("No valid tokens provided", param="tokens")
 
-    records = await repo.get_accounts(cleaned)
+    records = await _get_accounts_batched(repo, cleaned)
     if not records:
         raise AppError(
             "No matching accounts found",
@@ -472,20 +514,20 @@ async def toggle_tokens_disabled(
                 clear_failures=True,
             ))
 
-    result = await repo.patch_accounts(patches)
+    patched = await _patch_accounts_batched(repo, patches)
     logger.info(
         "admin tokens disabled batch updated: disabled={} requested_count={} patched_count={}",
         req.disabled,
         len(cleaned),
-        result.patched,
+        patched,
     )
     return _json({
         "status": "success",
         "disabled": req.disabled,
         "summary": {
             "total": len(cleaned),
-            "ok": result.patched,
-            "fail": max(0, len(cleaned) - result.patched),
+            "ok": patched,
+            "fail": max(0, len(cleaned) - patched),
         },
     })
 

@@ -94,7 +94,12 @@ class AccountRefreshService:
         try:
             from app.dataplane.reverse.protocol.xai_usage import fetch_all_quotas
 
-            return await fetch_all_quotas(token, supported_mode_ids(pool))
+            usage_modes = tuple(
+                mode_id for mode_id in supported_mode_ids(pool) if mode_id != 5
+            )
+            if not usage_modes:
+                return None
+            return await fetch_all_quotas(token, usage_modes)
         except UpstreamError:
             raise
         except Exception as exc:
@@ -280,6 +285,48 @@ class AccountRefreshService:
         records = [r for r in await self._repo.get_accounts(tokens) if is_manageable(r)]
         concurrency = get_config("account.refresh.usage_concurrency", 50)
         results = await run_batch(records, self._refresh_one, concurrency=concurrency)
+        agg = RefreshResult()
+        for r in results:
+            agg.merge(r)
+        return agg
+
+    async def revive_expired_tokens(
+        self,
+        tokens: list[str],
+        *,
+        concurrency: int = 2,
+    ) -> RefreshResult:
+        """Conservatively re-check expired tokens and reactivate only real successes.
+
+        This is intentionally stricter than ``refresh_tokens``:
+        - only expired records are considered
+        - fallback quota estimates are disabled
+        - a token is cleared back to ACTIVE only after live quota data is fetched
+        """
+        from .commands import AccountPatch
+
+        records = [
+            r
+            for r in await self._repo.get_accounts(tokens)
+            if not r.is_deleted() and r.status == AccountStatus.EXPIRED
+        ]
+        if not records:
+            return RefreshResult()
+
+        async def _revive_one(record: AccountRecord) -> RefreshResult:
+            result = await self._refresh_one(record, apply_fallback=False)
+            if result.refreshed:
+                await self._repo.patch_accounts(
+                    [AccountPatch(token=record.token, clear_failures=True)]
+                )
+                result.recovered += 1
+            return result
+
+        results = await run_batch(
+            records,
+            _revive_one,
+            concurrency=max(1, min(int(concurrency), 10)),
+        )
         agg = RefreshResult()
         for r in results:
             agg.merge(r)
