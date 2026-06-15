@@ -6,12 +6,20 @@
 # 进入项目目录
 cd grok2api
 
-# 一键启动
+# 一键启动（新版 Docker Compose）
 docker compose up -d --build
 
+# 或使用旧版命令（如果上面报错）
+docker-compose up -d --build
+
 # 查看日志
-docker compose logs -f
+docker compose logs -f        # 新版
+docker-compose logs -f        # 旧版
 ```
+
+> ⚠️ **命令格式说明**: `docker compose`（空格）是新版，`docker-compose`（连字符）是旧版。  
+> 如果报错 `unknown shorthand flag: 'd'`，说明你的系统使用旧版，请用 `docker-compose`。  
+> 详见 **DOCKER_COMPOSE_COMPAT.md**
 
 就这么简单！服务已启动在 `http://localhost:8000`
 

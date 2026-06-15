@@ -7,9 +7,24 @@ echo "  目标: 2C2G 服务器 + 10 万账号稳定运行"
 echo "================================================"
 echo ""
 
+# 检测 Docker Compose 命令
+if docker compose version &> /dev/null; then
+    COMPOSE_CMD="docker compose"
+    echo "✅ 检测到新版 Docker Compose"
+elif command -v docker-compose &> /dev/null; then
+    COMPOSE_CMD="docker-compose"
+    echo "✅ 检测到旧版 Docker Compose"
+else
+    echo "❌ 错误: 未找到 Docker Compose"
+    echo "请先安装: sudo apt-get install docker-compose-plugin"
+    exit 1
+fi
+echo "   使用命令: $COMPOSE_CMD"
+echo ""
+
 # 1. 停止容器
 echo "📦 [1/6] 停止现有容器..."
-docker compose down
+$COMPOSE_CMD down
 
 # 2. 压缩数据库（清理碎片）
 if [ -f "data/accounts.db" ]; then
@@ -61,14 +76,14 @@ fi
 
 # 5. 重新构建并启动
 echo "🚀 [5/6] 重新构建并启动容器..."
-docker compose up -d --build
+$COMPOSE_CMD up -d --build
 
 # 6. 等待服务启动
 echo "⏳ [6/6] 等待服务启动..."
 sleep 10
 
 # 检查容器状态
-if docker compose ps | grep -q "grok2api.*Up"; then
+if $COMPOSE_CMD ps | grep -q "grok2api.*Up"; then
     echo ""
     echo "✅ 部署成功！"
     echo ""
@@ -80,13 +95,13 @@ if docker compose ps | grep -q "grok2api.*Up"; then
     echo "================================================"
     echo "📝 最近日志:"
     echo "================================================"
-    docker compose logs --tail=20
+    $COMPOSE_CMD logs --tail=20
     echo ""
     echo "================================================"
     echo "🎯 下一步:"
     echo "================================================"
     echo "1. 查看实时日志:"
-    echo "   docker compose logs -f"
+    echo "   $COMPOSE_CMD logs -f"
     echo ""
     echo "2. 监控内存占用:"
     echo "   watch -n 5 'docker stats --no-stream grok2api'"
@@ -95,12 +110,12 @@ if docker compose ps | grep -q "grok2api.*Up"; then
     echo "   curl http://localhost:8000/health"
     echo ""
     echo "4. 验证 random 模式:"
-    echo "   docker compose logs | grep 'selection strategy'"
+    echo "   $COMPOSE_CMD logs | grep 'selection strategy'"
     echo "   预期输出: selection strategy set to: random"
     echo ""
 else
     echo ""
     echo "❌ 部署失败，请查看日志:"
-    echo "   docker compose logs"
+    echo "   $COMPOSE_CMD logs"
     exit 1
 fi
