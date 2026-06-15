@@ -1,3 +1,15 @@
+[app]
+# 管理后台密码
+app_key = "grok2api"
+# 应用访问地址
+app_url = "http://0.0.0.0:8080"
+# API 调用密钥 (Bearer token)
+api_key = "sk-sanbo"
+# 启用 WebUI
+webui_enabled = false
+# WebUI 访问密码
+webui_key = ""
+
 [account.refresh]
 # 🔴 关键配置：关闭配额主动探测，改用随机选号模式
 # 效果：内存占用 -65%，CPU 占用 -90%，零后台网络请求
@@ -14,6 +26,22 @@ usage_concurrency = 0
 [account.selection]
 # 单号最大并发请求数
 max_inflight = 8
+# 选号策略：fast 模式由独立的 grok2api-probe 进程喂数据
+strategy = "fast"
+# fast 模式：从最快的前 20% 中随机选
+fast_top_pct = 0.2
+
+[probe]
+# 探针 side-car 进程的配置；本进程不读，但 grok2api-probe 容器会读
+enabled = true
+interval_sec = 14400
+model = "grok-4.20-fast"
+max_tokens = 1
+request_timeout_sec = 30
+concurrency = 2
+batch_size = 10
+inter_batch_sleep_sec = 1.5
+idle_sleep_sec = 60
 
 [retry]
 # 失败时换号重试次数

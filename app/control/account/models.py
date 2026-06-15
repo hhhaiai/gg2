@@ -202,6 +202,11 @@ class AccountRecord(BaseModel):
     last_fail_reason: str | None = None
     last_sync_at: int | None = None
     last_clear_at: int | None = None
+    # Probe worker: latency recorded by the side-car probe process.
+    # ``last_latency_ms`` is end-to-end wall time of a ``max_tokens=1`` chat.
+    # ``last_probe_at`` is the ms timestamp of that probe (None = never probed).
+    last_latency_ms: int | None = None
+    last_probe_at: int | None = None
     state_reason: str | None = None
     deleted_at: int | None = None
     ext: dict[str, Any] = Field(default_factory=dict)

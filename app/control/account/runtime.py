@@ -11,6 +11,8 @@ if TYPE_CHECKING:
     from .refresh import AccountRefreshService
     from .scheduler import AccountRefreshScheduler
 
+_StrategyLiteral = Literal["quota", "random", "fast"]
+
 _refresh_service: "AccountRefreshService | None" = None
 _refresh_scheduler: "AccountRefreshScheduler | None" = None
 _refresh_scheduler_leader = False
@@ -51,28 +53,39 @@ def is_refresh_scheduler_leader() -> bool:
 
 def reconcile_refresh_runtime(
     enabled: bool | None = None,
-) -> Literal["quota", "random"]:
-    """Hot-apply refresh strategy and scheduler state for the current worker."""
+) -> _StrategyLiteral:
+    """Hot-apply refresh strategy and scheduler state for the current worker.
+
+    Strategy precedence:
+      1. ``account.selection.strategy``  — explicit user override ("fast" | "random" | "quota").
+      2. ``account.refresh.enabled``     — historical boolean (true → "quota", false → "random").
+    """
     from app.dataplane.account.selector import current_strategy, set_strategy
     from app.platform.config.snapshot import config
     from app.platform.logging.logger import logger
 
-    refresh_enabled = (
-        config.get_bool("account.refresh.enabled", False)
-        if enabled is None
-        else bool(enabled)
-    )
-    target_strategy: Literal["quota", "random"] = (
-        "quota" if refresh_enabled else "random"
-    )
+    raw_strategy = config.get("account.selection.strategy")
+    if raw_strategy in ("fast", "random", "quota"):
+        target_strategy: _StrategyLiteral = raw_strategy  # type: ignore[assignment]
+    else:
+        refresh_enabled = (
+            config.get_bool("account.refresh.enabled", False)
+            if enabled is None
+            else bool(enabled)
+        )
+        target_strategy = "quota" if refresh_enabled else "random"
+
     previous_strategy = current_strategy()
     if previous_strategy != target_strategy:
         set_strategy(target_strategy)
 
     scheduler_action = "unchanged"
     scheduler = _refresh_scheduler
-    if scheduler is not None and _refresh_scheduler_leader:
-        if refresh_enabled:
+    # The fast strategy reads latency from the side-car probe worker — the
+    # quota refresh scheduler is unrelated and should stay in its current
+    # state (driven by ``account.refresh.enabled``).
+    if scheduler is not None and _refresh_scheduler_leader and raw_strategy is None:
+        if target_strategy == "quota":
             if not scheduler.is_running():
                 scheduler.start()
                 scheduler_action = "started"

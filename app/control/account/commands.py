@@ -48,6 +48,9 @@ class AccountPatch(BaseModel):
     last_fail_reason: str | None             = None
     last_sync_at:     int | None             = None
     last_clear_at:    int | None             = None
+    # Probe worker results — written by the side-car probe process.
+    last_latency_ms:  int | None             = None
+    last_probe_at:    int | None             = None
     state_reason:     str | None             = None
     ext_merge:        dict[str, Any] | None  = None
     clear_failures:   bool                   = False

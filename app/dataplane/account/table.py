@@ -178,6 +178,16 @@ class AccountRuntimeTable:
         default_factory=lambda: array.array("L")
     )
 
+    # --- Probe worker results (uint32) ---
+    # last_latency_ms stores the wall-clock ms of a max_tokens=1 chat (0 = unknown).
+    # last_probe_s stores the epoch-second timestamp of the probe (0 = never probed).
+    last_latency_ms_by_idx: "array.array[int]" = field(
+        default_factory=lambda: array.array("L")
+    )
+    last_probe_s_by_idx: "array.array[int]" = field(
+        default_factory=lambda: array.array("L")
+    )
+
     # --- Pre-computed selection indexes ---
     # (pool_id, mode_id) → set of idx with a supported quota window and status == ACTIVE
     mode_available: dict[tuple[int, int], set[int]] = field(default_factory=dict)
@@ -246,6 +256,12 @@ class AccountRuntimeTable:
             return self.window_grok_4_3_by_idx
         return self.window_console_by_idx
 
+    def last_latency_col(self) -> "array.array[int]":
+        return self.last_latency_ms_by_idx
+
+    def last_probe_col(self) -> "array.array[int]":
+        return self.last_probe_s_by_idx
+
     def _add_to_indexes(self, idx: int) -> None:
         pool_id   = int(self.pool_by_idx[idx])
         status_id = int(self.status_by_idx[idx])
@@ -309,6 +325,8 @@ class AccountRuntimeTable:
         last_use_s:      int,
         last_fail_s:     int,
         fail_count:      int,
+        last_latency_ms: int,
+        last_probe_s:    int,
         tags:            list[str],
     ) -> int:
         idx = len(self.token_by_idx)
@@ -346,6 +364,8 @@ class AccountRuntimeTable:
         self.last_use_at_by_idx.append(last_use_s)
         self.last_fail_at_by_idx.append(last_fail_s)
         self.cooling_until_s_by_idx.append(0)
+        self.last_latency_ms_by_idx.append(min(last_latency_ms, 4_294_967_295))
+        self.last_probe_s_by_idx.append(min(last_probe_s, 4_294_967_295))
         self.size += 1
         self._add_to_indexes(idx)
         self._add_to_tag_idx(idx, tags)
@@ -389,6 +409,8 @@ class AccountRuntimeTable:
         last_use_s: int,
         last_fail_s: int,
         fail_count: int,
+        last_latency_ms: int,
+        last_probe_s: int,
         old_tags: list[str],
         new_tags: list[str],
     ) -> None:
@@ -424,6 +446,8 @@ class AccountRuntimeTable:
         self.fail_count_by_idx[idx] = min(fail_count, 65535)
         self.last_use_at_by_idx[idx] = last_use_s
         self.last_fail_at_by_idx[idx] = last_fail_s
+        self.last_latency_ms_by_idx[idx] = min(last_latency_ms, 4_294_967_295)
+        self.last_probe_s_by_idx[idx] = min(last_probe_s, 4_294_967_295)
         # health is not reset on update
 
         self._add_to_indexes(idx)

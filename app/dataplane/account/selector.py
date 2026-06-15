@@ -35,7 +35,7 @@ _RECENT_WINDOW_S = 15  # seconds
 # Strategy registry
 # ---------------------------------------------------------------------------
 
-_StrategyName = Literal["quota", "random"]
+_StrategyName = Literal["quota", "random", "fast"]
 _STRATEGY_NAME: _StrategyName = "random"
 
 
@@ -45,7 +45,7 @@ def set_strategy(name: _StrategyName) -> None:
     Called once by the lifespan after reading ``account.refresh.enabled``.
     """
     global _STRATEGY_NAME
-    if name not in ("quota", "random"):
+    if name not in ("quota", "random", "fast"):
         raise ValueError(f"unknown selection strategy: {name!r}")
     _STRATEGY_NAME = name
 
@@ -73,6 +73,13 @@ def select(
     Returns the slot index or ``None`` when no candidate is available.
     Does not mutate the table — callers increment inflight separately.
     """
+    if _STRATEGY_NAME == "fast":
+        return _fast_select(
+            table, pool_id, mode_id,
+            exclude_idxs=exclude_idxs,
+            prefer_tag_idxs=prefer_tag_idxs,
+            now_s=now_s,
+        )
     if _STRATEGY_NAME == "random":
         return _random_select(
             table, pool_id,
@@ -100,6 +107,13 @@ def select_any(
 
     Used by WebSocket-based products that manage their own rate limiting.
     """
+    if _STRATEGY_NAME == "fast":
+        return _fast_select_any(
+            table, pool_id,
+            exclude_idxs=exclude_idxs,
+            prefer_tag_idxs=prefer_tag_idxs,
+            now_s=now_s,
+        )
     if _STRATEGY_NAME == "random":
         return _random_select(
             table, pool_id,
@@ -317,6 +331,118 @@ def _random_select(
         working = preferred if preferred else working
 
     return random.choice(tuple(working))
+
+
+# ---------------------------------------------------------------------------
+# Strategy: fast — prefer low-latency accounts (probe worker driven)
+# ---------------------------------------------------------------------------
+
+
+def _get_fast_top_pct() -> float:
+    """Fraction of fastest accounts to sample from.  Configurable."""
+    raw = get_config("account.selection.fast_top_pct", 0.2)
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.2
+    # Clamp to a sane range to avoid degenerate behaviour.
+    if v <= 0 or v > 1:
+        return 0.2
+    return v
+
+
+def _fast_select(
+    table: AccountRuntimeTable,
+    pool_id: int,
+    mode_id: int,
+    *,
+    exclude_idxs: frozenset[int] | None,
+    prefer_tag_idxs: set[int] | None,
+    now_s: int,
+) -> int | None:
+    candidates: set[int] | None = table.mode_available.get((pool_id, mode_id))
+    if not candidates:
+        return None
+
+    max_inflight = int(get_config("account.selection.max_inflight", 8))
+    cooling_col  = table.cooling_until_s_by_idx
+    inflight_col = table.inflight_by_idx
+
+    working: set[int] = candidates.copy()
+    if exclude_idxs:
+        working -= exclude_idxs
+    working = {
+        idx for idx in working
+        if int(cooling_col[idx]) <= now_s
+        and int(inflight_col[idx]) < max_inflight
+    }
+    if not working:
+        return None
+
+    if prefer_tag_idxs:
+        preferred = working & prefer_tag_idxs
+        working = preferred if preferred else working
+
+    return _fast_pick(table, working)
+
+
+def _fast_select_any(
+    table: AccountRuntimeTable,
+    pool_id: int,
+    *,
+    exclude_idxs: frozenset[int] | None,
+    prefer_tag_idxs: set[int] | None,
+    now_s: int,
+) -> int | None:
+    candidates: set[int] = _pool_union(table, pool_id)
+    if not candidates:
+        return None
+
+    max_inflight = int(get_config("account.selection.max_inflight", 8))
+    cooling_col  = table.cooling_until_s_by_idx
+    inflight_col = table.inflight_by_idx
+
+    working = candidates.copy()
+    if exclude_idxs:
+        working -= exclude_idxs
+    working = {
+        idx for idx in working
+        if int(cooling_col[idx]) <= now_s
+        and int(inflight_col[idx]) < max_inflight
+    }
+    if not working:
+        return None
+
+    if prefer_tag_idxs:
+        preferred = working & prefer_tag_idxs
+        working = preferred if preferred else working
+
+    return _fast_pick(table, working)
+
+
+def _fast_pick(
+    table: AccountRuntimeTable,
+    working: set[int],
+) -> int | None:
+    """Pick from the top-N% fastest probed accounts; fall back to random
+    when no account in *working* has been probed yet.
+    """
+    if not working:
+        return None
+
+    latency_col = table.last_latency_col()
+    probe_col   = table.last_probe_col()
+
+    probed = [idx for idx in working
+              if int(probe_col[idx]) > 0 and int(latency_col[idx]) > 0]
+    if not probed:
+        # Nothing has been probed yet — uniform random so we still serve traffic.
+        return random.choice(tuple(working))
+
+    probed.sort(key=lambda i: int(latency_col[i]))
+    top_pct = _get_fast_top_pct()
+    top_n = max(1, int(len(probed) * top_pct))
+    return random.choice(probed[:top_n])
 
 
 # ---------------------------------------------------------------------------

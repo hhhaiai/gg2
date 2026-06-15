@@ -31,7 +31,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./config.toml:/app/config.toml     # 挂载自定义配置（关闭配额刷新）
+      - ./config.toml:/app/data/config.toml  # 挂载自定义配置（覆盖运行时配置）
     restart: unless-stopped
     # 资源限制：适配 2c2g 服务器 + 10 万账号（random 模式）
     deploy:
@@ -49,6 +49,38 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+
+  # Side-car 探针进程:独立容器跑 `python -m app.probe`,持续向 grok.com 发
+  # max_tokens=1 的真实聊天请求,记录每个账号的 last_latency_ms / last_probe_at
+  # 到共享的 SQLite DB。API 进程(grok2api)以 60s 周期把这些结果同步到内存表,
+  # 当 account.selection.strategy="fast" 时驱动低延迟账号优先选号。
+  # 资源占用被故意压低 (cpus=0.5, memory=512M),适合 2c2g 服务器。
+  grok2api-probe:
+    container_name: grok2api-probe
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.probe"]
+    environment:
+      TZ: Asia/Shanghai
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FILE_ENABLED: "true"
+      ACCOUNT_STORAGE: ${ACCOUNT_STORAGE:-local}
+      ACCOUNT_LOCAL_PATH: ${ACCOUNT_LOCAL_PATH:-data/accounts.db}
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
 
   # 如果出口 IP 不干净，可取消以下注释使用 Warp 作为落地代理
   # 启用后将 proxy.base_proxy_url 设为 socks5://warp:1080

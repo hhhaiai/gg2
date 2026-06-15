@@ -37,6 +37,19 @@ class AccountRepository(Protocol):
         """Return records modified after *since_revision* (inclusive)."""
         ...
 
+    async def scan_changes_since_probe(
+        self,
+        since_probe_at_ms: int,
+        *,
+        limit: int = 5000,
+    ) -> list[AccountRecord]:
+        """Return records whose ``last_probe_at`` is greater than the watermark.
+
+        Used by the API server to incrementally pull latency updates written by
+        the side-car probe worker.  Excludes soft-deleted accounts.
+        """
+        ...
+
     async def upsert_accounts(
         self,
         items: list[AccountUpsert],

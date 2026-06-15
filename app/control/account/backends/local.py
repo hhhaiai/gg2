@@ -74,6 +74,8 @@ class LocalAccountRepository:
                     last_fail_reason   TEXT,
                     last_sync_at       INTEGER,
                     last_clear_at      INTEGER,
+                    last_latency_ms    INTEGER,
+                    last_probe_at      INTEGER,
                     state_reason       TEXT,
                     deleted_at         INTEGER,
                     ext                TEXT    NOT NULL DEFAULT '{{}}',
@@ -88,6 +90,10 @@ class LocalAccountRepository:
             """)
             self._ensure_column_sync(conn, "quota_grok_4_3", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column_sync(conn, "quota_console", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column_sync(conn, "last_latency_ms", "INTEGER")
+            self._ensure_column_sync(conn, "last_probe_at", "INTEGER")
+            self._ensure_index_sync(conn, "idx_acc_probe",
+                f"CREATE INDEX IF NOT EXISTS idx_acc_probe ON {_TBL} (last_probe_at) WHERE last_probe_at IS NOT NULL")
             conn.commit()
 
     @staticmethod
@@ -95,6 +101,12 @@ class LocalAccountRepository:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({_TBL})").fetchall()}
         if name not in cols:
             conn.execute(f"ALTER TABLE {_TBL} ADD COLUMN {name} {ddl}")
+
+    @staticmethod
+    def _ensure_index_sync(conn: sqlite3.Connection, name: str, ddl: str) -> None:
+        idxs = {row[1] for row in conn.execute(f"PRAGMA index_list({_TBL})").fetchall()}
+        if name not in idxs:
+            conn.execute(ddl)
 
     def _bump_revision(self, conn: sqlite3.Connection) -> int:
         conn.execute(
@@ -156,6 +168,8 @@ class LocalAccountRepository:
             "last_fail_reason": record.last_fail_reason,
             "last_sync_at":     record.last_sync_at,
             "last_clear_at":    record.last_clear_at,
+            "last_latency_ms":  record.last_latency_ms,
+            "last_probe_at":    record.last_probe_at,
             "state_reason":     record.state_reason,
             "deleted_at":       record.deleted_at,
             "ext":              json.dumps(record.ext),
@@ -253,6 +267,10 @@ class LocalAccountRepository:
                 sets["last_sync_at"] = patch.last_sync_at
             if patch.last_clear_at is not None:
                 sets["last_clear_at"] = patch.last_clear_at
+            if patch.last_latency_ms is not None:
+                sets["last_latency_ms"] = patch.last_latency_ms
+            if patch.last_probe_at is not None:
+                sets["last_probe_at"] = patch.last_probe_at
 
             # Usage counters (delta).
             if patch.usage_use_delta is not None:
@@ -365,6 +383,26 @@ class LocalAccountRepository:
                     deleted_tokens=deleted,
                     has_more=has_more,
                 )
+        return await asyncio.to_thread(_sync)
+
+    async def scan_changes_since_probe(
+        self,
+        since_probe_at_ms: int,
+        *,
+        limit: int = 5000,
+    ) -> list[AccountRecord]:
+        def _sync() -> list[AccountRecord]:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"SELECT * FROM {_TBL} "
+                    f"WHERE deleted_at IS NULL "
+                    f"AND last_probe_at IS NOT NULL "
+                    f"AND last_probe_at > ? "
+                    f"ORDER BY last_probe_at ASC "
+                    f"LIMIT ?",
+                    (since_probe_at_ms, limit),
+                ).fetchall()
+                return [self._row_to_record(r) for r in rows]
         return await asyncio.to_thread(_sync)
 
     async def upsert_accounts(

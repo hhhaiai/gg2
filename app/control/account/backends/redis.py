@@ -73,6 +73,8 @@ class RedisAccountRepository:
             "last_fail_reason": record.last_fail_reason or "",
             "last_sync_at":     str(record.last_sync_at or ""),
             "last_clear_at":    str(record.last_clear_at or ""),
+            "last_latency_ms":  str(record.last_latency_ms or ""),
+            "last_probe_at":    str(record.last_probe_at or ""),
             "state_reason":     record.state_reason or "",
             "deleted_at":       str(record.deleted_at or ""),
             "ext":              json.dumps(record.ext),
@@ -118,6 +120,8 @@ class RedisAccountRepository:
             "last_fail_reason": _s("last_fail_reason") or None,
             "last_sync_at":     _i("last_sync_at"),
             "last_clear_at":    _i("last_clear_at"),
+            "last_latency_ms":  _i("last_latency_ms"),
+            "last_probe_at":    _i("last_probe_at"),
             "state_reason":     _s("state_reason") or None,
             "deleted_at":       _i("deleted_at"),
             "ext":              json.loads(_s("ext") or "{}"),
@@ -198,6 +202,31 @@ class RedisAccountRepository:
             has_more=len(entries) == limit,
         )
 
+    async def scan_changes_since_probe(
+        self,
+        since_probe_at_ms: int,
+        *,
+        limit: int = 5000,
+    ) -> list[AccountRecord]:
+        # Full scan — filter to records with a fresher probe than the watermark.
+        out: list[AccountRecord] = []
+        async for key in self._r.scan_iter("accounts:record:*"):
+            token = (key.decode() if isinstance(key, bytes) else key).split(":", 2)[-1]
+            h = await self._r.hgetall(key)
+            if not h:
+                continue
+            r = self._from_hash(token, h)
+            if r.is_deleted():
+                continue
+            probe_at = int(r.last_probe_at or 0)
+            if probe_at <= since_probe_at_ms:
+                continue
+            out.append(r)
+            if len(out) >= limit:
+                break
+        out.sort(key=lambda r: int(r.last_probe_at or 0))
+        return out
+
     async def upsert_accounts(
         self,
         items: list[AccountUpsert],
@@ -264,6 +293,10 @@ class RedisAccountRepository:
                 updates["last_sync_at"] = str(patch.last_sync_at)
             if patch.last_clear_at is not None:
                 updates["last_clear_at"] = str(patch.last_clear_at)
+            if patch.last_latency_ms is not None:
+                updates["last_latency_ms"] = str(patch.last_latency_ms)
+            if patch.last_probe_at is not None:
+                updates["last_probe_at"] = str(patch.last_probe_at)
             if patch.pool is not None:
                 updates["pool"] = patch.pool
             if patch.quota_auto is not None:

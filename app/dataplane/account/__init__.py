@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from app.platform.config.snapshot import get_config
 from app.platform.logging.logger import logger
-from app.platform.runtime.clock import now_s
+from app.platform.runtime.clock import ms_to_s, now_ms, now_s
 from app.control.account.repository import AccountRepository
 from app.control.account.enums import FeedbackKind
 from .table import AccountRuntimeTable
@@ -40,6 +40,9 @@ class AccountDirectory:
         self._table: AccountRuntimeTable | None = None
         self._lock = asyncio.Lock()
         self._sync_lock = asyncio.Lock()
+        # Probe latency watermark — tracks the highest ``last_probe_at`` we have
+        # already pulled from the repo so we only fetch deltas on each tick.
+        self._latency_watermark_ms: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -73,6 +76,59 @@ class AccountDirectory:
                     table.size,
                 )
             return changed
+
+    async def sync_latency_from_db(self, *, batch_limit: int = 5000) -> int:
+        """Pull probe latency updates written by the side-car probe worker.
+
+        Each call advances a watermark — only accounts whose ``last_probe_at``
+        is greater than the previously-seen maximum are fetched.  Returns the
+        number of records applied to the runtime table.
+
+        Cheap on a steady state: a 60-second tick typically pulls a few hundred
+        rows in a single ``SELECT ... WHERE last_probe_at > ?``.
+        """
+        if self._table is None:
+            return 0
+
+        async with self._sync_lock:
+            watermark = self._latency_watermark_ms
+            try:
+                rows = await self._repo.scan_changes_since_probe(
+                    since_probe_at_ms=watermark, limit=batch_limit
+                )
+            except Exception as exc:
+                logger.warning("latency sync fetch failed: err={}", exc)
+                return 0
+
+            applied = 0
+            max_seen = watermark
+            async with self._lock:
+                table = self._table
+                if table is None:
+                    return 0
+                for record in rows:
+                    idx = table.idx_by_token.get(record.token)
+                    if idx is None:
+                        continue
+                    latency_ms = int(record.last_latency_ms or 0)
+                    probe_at_ms = int(record.last_probe_at or 0)
+                    if probe_at_ms <= 0:
+                        continue
+                    table.last_latency_ms_by_idx[idx] = min(latency_ms, 4_294_967_295)
+                    table.last_probe_s_by_idx[idx] = min(
+                        ms_to_s(probe_at_ms), 4_294_967_295
+                    )
+                    applied += 1
+                    if probe_at_ms > max_seen:
+                        max_seen = probe_at_ms
+                self._latency_watermark_ms = max_seen
+
+            if applied:
+                logger.debug(
+                    "latency sync applied: rows={} watermark_ms={}",
+                    applied, max_seen,
+                )
+            return applied
 
     # ------------------------------------------------------------------
     # Selection (hot path)

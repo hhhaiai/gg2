@@ -135,6 +135,36 @@ recent_sync_skip_sec = 300
 [account.selection]
 # 单号并发上限（两模式共用）
 max_inflight = 8
+# 选号策略：random | quota | fast
+#   random — 均匀随机（默认；零探测）
+#   quota  — 按健康度/配额/失败次数评分（需 account.refresh.enabled=true）
+#   fast   — 从探测到的最快前 N% 中随机（需运行 app.probe side-car）
+strategy = "random"
+# fast 策略：从最快的前 fast_top_pct 中随机，避免单个最低延迟账号被打爆
+fast_top_pct = 0.2
+
+
+# ==================== 探针 worker（side-car 进程）====================
+# 仅在 strategy = "fast" 时有意义。独立进程跑 `python -m app.probe`。
+[probe]
+# 是否启用探针（false = 不启动）
+enabled = true
+# 单个账号探测间隔（秒）；一轮完整探测 = accounts / concurrency * inter_batch_sleep
+interval_sec = 14400       # 4 小时 — 24k 账号在 2 并发 + 1.5s 间隔下约 14 小时一轮
+# 探测使用的 model（仅用于 max_tokens 路径）
+model = "grok-4.20-fast"
+# 探测请求的 maxTokens（越小越省资源；1 = 极简）
+max_tokens = 1
+# 单次探测超时（秒）
+request_timeout_sec = 30
+# 探测并发数（建议 ≤ 4，避免压垮 2c2g 服务器出口）
+concurrency = 2
+# 每批探测数量
+batch_size = 10
+# 批间休眠（秒）— 与 concurrency 一起决定平均 RPS
+inter_batch_sleep_sec = 1.5
+# 一轮探测完毕后的空闲等待（秒）
+idle_sleep_sec = 60
 
 
 # ==================== 对话配置 ====================

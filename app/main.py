@@ -250,6 +250,34 @@ async def lifespan(app: FastAPI):
             _SYNC_IDLE_INTERVAL,
         )
 
+    # 4a. Latency sync loop — only when the fast selector is active.
+    #     Pulls ``last_latency_ms`` / ``last_probe_at`` written by the side-car
+    #     probe worker into the in-memory table without forcing the API
+    #     process to talk to upstream.
+    _LATENCY_SYNC_INTERVAL = int(os.getenv("LATENCY_SYNC_INTERVAL", "60"))
+    latency_task: asyncio.Task | None = None
+    if strategy_name == "fast":
+        async def _latency_sync_loop() -> None:
+            while True:
+                await asyncio.sleep(_LATENCY_SYNC_INTERVAL)
+                try:
+                    applied = await directory.sync_latency_from_db()
+                    if applied:
+                        logger.debug(
+                            "latency sync tick: applied={} interval_s={}",
+                            applied, _LATENCY_SYNC_INTERVAL,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("latency sync error: err={}", exc)
+
+        latency_task = asyncio.create_task(_latency_sync_loop(), name="latency-sync")
+        logger.info(
+            "latency sync loop started: strategy=fast interval_s={}",
+            _LATENCY_SYNC_INTERVAL,
+        )
+
     # 5. Initialise proxy directory and start clearance refresh scheduler.
     from app.control.proxy import get_proxy_directory
     from app.control.proxy.scheduler import ProxyClearanceScheduler
@@ -282,6 +310,12 @@ async def lifespan(app: FastAPI):
         await sync_task
     except asyncio.CancelledError:
         pass
+    if latency_task is not None:
+        latency_task.cancel()
+        try:
+            await latency_task
+        except asyncio.CancelledError:
+            pass
 
     if is_leader:
         scheduler.stop()

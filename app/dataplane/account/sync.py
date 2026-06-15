@@ -67,6 +67,8 @@ def _record_to_slot_args(record: AccountRecord) -> dict:
         last_use_s      = ms_to_s(record.last_use_at)  if record.last_use_at  else 0,
         last_fail_s     = ms_to_s(record.last_fail_at) if record.last_fail_at else 0,
         fail_count      = record.usage_fail_count,
+        last_latency_ms = max(0, int(record.last_latency_ms or 0)),
+        last_probe_s    = ms_to_s(record.last_probe_at) if record.last_probe_at else 0,
         tags            = record.tags,
     )
     # fmt: on

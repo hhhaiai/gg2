@@ -56,6 +56,8 @@ accounts_table = sa.Table(
     sa.Column("last_fail_reason", sa.Text),
     sa.Column("last_sync_at",     sa.BigInteger),
     sa.Column("last_clear_at",    sa.BigInteger),
+    sa.Column("last_latency_ms",  sa.BigInteger),
+    sa.Column("last_probe_at",    sa.BigInteger),
     sa.Column("state_reason",     sa.Text),
     sa.Column("deleted_at",       sa.BigInteger),
     sa.Column("ext",              sa.Text,    nullable=False, default="{}"),
@@ -566,6 +568,16 @@ class SqlAccountRepository:
                     f"ALTER TABLE {_TBL_ACCOUNTS} "
                     f"ADD COLUMN quota_console TEXT NOT NULL DEFAULT '{{}}'"
                 )
+        if "last_latency_ms" not in existing:
+            await conn.exec_driver_sql(
+                f"ALTER TABLE {_TBL_ACCOUNTS} "
+                f"ADD COLUMN last_latency_ms BIGINT"
+            )
+        if "last_probe_at" not in existing:
+            await conn.exec_driver_sql(
+                f"ALTER TABLE {_TBL_ACCOUNTS} "
+                f"ADD COLUMN last_probe_at BIGINT"
+            )
 
     async def _table_columns(self, conn: Any, table: str) -> set[str]:
         if self._dialect == "postgresql":
@@ -632,6 +644,26 @@ class SqlAccountRepository:
                 deleted_tokens=deleted,
                 has_more=len(rows) == limit,
             )
+
+    async def scan_changes_since_probe(
+        self,
+        since_probe_at_ms: int,
+        *,
+        limit: int = 5000,
+    ) -> list[AccountRecord]:
+        await self._ensure_initialized()
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(
+                sa.select(accounts_table)
+                .where(
+                    accounts_table.c.deleted_at.is_(None),
+                    accounts_table.c.last_probe_at.isnot(None),
+                    accounts_table.c.last_probe_at > since_probe_at_ms,
+                )
+                .order_by(accounts_table.c.last_probe_at.asc())
+                .limit(limit)
+            )).fetchall()
+            return [_row_to_record(r) for r in rows]
 
     async def upsert_accounts(
         self,
@@ -711,6 +743,10 @@ class SqlAccountRepository:
                     updates["last_sync_at"] = patch.last_sync_at
                 if patch.last_clear_at is not None:
                     updates["last_clear_at"] = patch.last_clear_at
+                if patch.last_latency_ms is not None:
+                    updates["last_latency_ms"] = patch.last_latency_ms
+                if patch.last_probe_at is not None:
+                    updates["last_probe_at"] = patch.last_probe_at
                 if patch.quota_auto is not None:
                     updates["quota_auto"] = json.dumps(patch.quota_auto)
                 if patch.quota_fast is not None:
