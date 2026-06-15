@@ -552,6 +552,25 @@ async def replace_pool(
 # ---------------------------------------------------------------------------
 
 async def _refresh_imported(svc: "AccountRefreshService", tokens: list[str]) -> None:
+    """Fire-and-forget quota sync for newly imported tokens.
+
+    In random mode (refresh.enabled=false), this is skipped entirely — accounts
+    become active immediately without any upstream validation. First API call will
+    naturally validate and mark any invalid tokens.
+
+    In quota mode (refresh.enabled=true), this probes every imported token to
+    populate initial quota state before they enter the selection pool.
+    """
+    from app.platform.config.snapshot import get_config
+
+    # Skip if random mode is active (refresh disabled)
+    if not get_config("account.refresh.enabled", True):
+        logger.info(
+            "admin import quota sync skipped (random mode): token_count={}",
+            len(tokens)
+        )
+        return
+
     try:
         await svc.refresh_on_import(tokens)
         logger.info("admin import quota sync completed: token_count={}", len(tokens))

@@ -170,7 +170,19 @@ class AccountRefreshService:
         Processes accounts in chunks to avoid memory/network spikes:
         - Each chunk is validated independently with bounded concurrency.
         - A short pause between chunks lets the event loop breathe.
+
+        In random mode (refresh.enabled=false), this method should not be called
+        at all — the caller (_refresh_imported) checks the config flag. But if
+        called anyway, we return early to avoid unnecessary network traffic.
         """
+        # Early exit in random mode
+        if not get_config("account.refresh.enabled", True):
+            logger.debug(
+                "refresh_on_import called in random mode, skipping: token_count={}",
+                len(tokens)
+            )
+            return RefreshResult(checked=len(tokens))
+
         records = await self._repo.get_accounts(tokens)
         active = [r for r in records if is_manageable(r)]
         if not active:
