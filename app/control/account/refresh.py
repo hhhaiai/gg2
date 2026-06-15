@@ -1,7 +1,7 @@
 """Account refresh service — mode-aware usage synchronisation."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from app.platform.errors import UpstreamError
@@ -43,6 +43,27 @@ class RefreshResult:
         self.disabled += other.disabled
         self.rate_limited += other.rate_limited
         self.failed += other.failed
+
+
+@dataclass
+class OnDemandResult:
+    """Result of an on-demand 429-triggered refresh.
+
+    Attributes:
+        refresh_result: Aggregated refresh stats from sampled accounts.
+        server_blocked: True when ALL sampled accounts failed, suggesting
+                        an IP-level block rather than individual account bans.
+        sampled: Number of accounts that were sampled for validation.
+        server_blocked_reason: Human-readable reason for UI notification.
+    """
+    refresh_result: RefreshResult = field(default_factory=RefreshResult)
+    server_blocked: bool = False
+    sampled: int = 0
+    server_blocked_reason: str = ""
+
+    @property
+    def success(self) -> bool:
+        return self.refresh_result.refreshed > 0
 
 
 _MODE_KEYS = {
@@ -144,21 +165,43 @@ class AccountRefreshService:
     # ------------------------------------------------------------------
 
     async def refresh_on_import(self, tokens: list[str]) -> RefreshResult:
-        """Called after bulk import — sync real quotas for all accounts."""
+        """Called after bulk import — sync real quotas for all accounts.
+
+        Processes accounts in chunks to avoid memory/network spikes:
+        - Each chunk is validated independently with bounded concurrency.
+        - A short pause between chunks lets the event loop breathe.
+        """
         records = await self._repo.get_accounts(tokens)
         active = [r for r in records if is_manageable(r)]
         if not active:
             return RefreshResult(checked=len(records))
 
-        concurrency = get_config("account.refresh.usage_concurrency", 50)
-        results = await run_batch(
-            active,
-            lambda r: self._refresh_one(r, apply_fallback=True),
-            concurrency=concurrency,
-        )
+        concurrency = get_config("account.refresh.usage_concurrency", 5)
+        chunk_size = get_config("account.refresh.import_chunk_size", 50)
         agg = RefreshResult(checked=len(records))
-        for r in results:
-            agg.merge(r)
+
+        for i in range(0, len(active), chunk_size):
+            chunk = active[i : i + chunk_size]
+            results = await run_batch(
+                chunk,
+                lambda r: self._refresh_one(r, apply_fallback=True),
+                concurrency=concurrency,
+            )
+            for r in results:
+                agg.merge(r)
+            # Brief pause between chunks to avoid saturating the uplink.
+            if i + chunk_size < len(active):
+                await asyncio.sleep(2.0)
+
+        logger.info(
+            "account import refresh completed: total={} chunks={} "
+            "refreshed={} failed={} expired={}",
+            len(active),
+            (len(active) + chunk_size - 1) // chunk_size,
+            agg.refreshed,
+            agg.failed,
+            agg.expired,
+        )
         return agg
 
     async def refresh_call_async(self, token: str, mode_id: int) -> None:
@@ -188,45 +231,203 @@ class AccountRefreshService:
     async def refresh_scheduled(self, pool: str | None = None) -> RefreshResult:
         """Periodic refresh — fetch real quotas for all (or one pool's) accounts.
 
+        Optimisations:
+        - Skip accounts used in the last ``recent_use_skip_sec`` seconds
+          (they already have fresh quota data from the call path).
+        - Skip accounts synced in the last ``recent_sync_skip_sec`` seconds
+          (avoid redundant upstream probes).
+        - Process in chunks with pauses to spread network load evenly
+          across the refresh interval instead of spiking.
+        - Default concurrency is now 5 (not 50) to avoid saturating
+          residential/cellular uplinks.
+
         Args:
             pool: When set, only refreshes accounts belonging to that pool.
                   When ``None``, refreshes all pools.
         """
+        import time as _time
+
         snapshot = await self._repo.runtime_snapshot()
         records = [r for r in snapshot.items if is_manageable(r)]
         if pool is not None:
             records = [r for r in records if r.pool == pool]
 
-        concurrency = get_config("account.refresh.usage_concurrency", 50)
-        results = await run_batch(
-            records,
-            lambda r: self._refresh_one(r, apply_fallback=True),
-            concurrency=concurrency,
+        if not records:
+            return RefreshResult()
+
+        now = now_ms()
+        recent_use_sec = int(get_config("account.refresh.recent_use_skip_sec", 300))
+        recent_sync_sec = int(get_config("account.refresh.recent_sync_skip_sec", 300))
+        use_cutoff = now - recent_use_sec * 1000
+        sync_cutoff = now - recent_sync_sec * 1000
+
+        # Filter out recently used / recently synced accounts.
+        to_refresh: list[AccountRecord] = []
+        skipped_recent = 0
+        for r in records:
+            if r.last_use_at and r.last_use_at > use_cutoff:
+                skipped_recent += 1
+                continue
+            if r.last_sync_at and r.last_sync_at > sync_cutoff:
+                skipped_recent += 1
+                continue
+            to_refresh.append(r)
+
+        if not to_refresh:
+            logger.debug(
+                "account scheduled refresh skipped: pool={} total={} all_recently_used",
+                pool or "all",
+                len(records),
+            )
+            return RefreshResult(checked=len(records))
+
+        logger.info(
+            "account scheduled refresh starting: pool={} total={} "
+            "to_refresh={} skipped_recent={}",
+            pool or "all",
+            len(records),
+            len(to_refresh),
+            skipped_recent,
         )
-        agg = RefreshResult()
-        for r in results:
-            agg.merge(r)
+
+        concurrency = get_config("account.refresh.usage_concurrency", 5)
+        chunk_size = get_config("account.refresh.import_chunk_size", 50)
+        agg = RefreshResult(checked=len(records))
+
+        # Spread chunks across time to flatten the network spike.
+        # For a 2h interval with 1000 accounts and chunk_size=50,
+        # each chunk gets ~144s pause → ~5 concurrent requests average.
+        interval_sec = 7200  # default; scheduler passes pool-specific interval
+        if pool is not None:
+            from .scheduler import _interval
+            interval_sec = _interval(pool)
+        n_chunks = max(1, (len(to_refresh) + chunk_size - 1) // chunk_size)
+        # Pause between chunks: spread evenly, but cap at 60s and floor at 1s.
+        spread_pause = max(1.0, min(60.0, interval_sec / n_chunks * 0.5))
+
+        for i in range(0, len(to_refresh), chunk_size):
+            chunk = to_refresh[i : i + chunk_size]
+            results = await run_batch(
+                chunk,
+                lambda r: self._refresh_one(r, apply_fallback=True),
+                concurrency=concurrency,
+            )
+            for r in results:
+                agg.merge(r)
+            # Spread pause between chunks.
+            if i + chunk_size < len(to_refresh):
+                await asyncio.sleep(spread_pause)
+
+        logger.info(
+            "account scheduled refresh completed: pool={} checked={} "
+            "refreshed={} recovered={} failed={} expired={} skipped_recent={}",
+            pool or "all",
+            agg.checked,
+            agg.refreshed,
+            agg.recovered,
+            agg.failed,
+            agg.expired,
+            skipped_recent,
+        )
         return agg
 
-    async def refresh_on_demand(self) -> RefreshResult:
-        """Throttled on-demand refresh triggered by request path."""
+    async def refresh_on_demand(
+        self,
+        *,
+        triggered_by_token: str | None = None,
+    ) -> "OnDemandResult":
+        """Throttled on-demand refresh triggered by 429 or request path.
+
+        Instead of refreshing ALL accounts (expensive), this now:
+        1. Samples up to ``on_demand_429_sample_size`` available accounts.
+        2. Validates each sampled account against the upstream API.
+        3. Detects server-level blocks vs individual account bans:
+           - If ALL sampled accounts fail → likely server block →
+             return ``server_blocked=True`` so the UI can notify.
+           - If SOME accounts succeed → individual account ban →
+             the banned account is excluded, others continue working.
+        """
+        import random as _random
+        import time
+
         min_interval = float(
             get_config("account.refresh.on_demand_min_interval_sec", 300)
         )
-        import time
 
         now = time.monotonic()
         if now - self._od_last < min_interval:
-            return RefreshResult()
+            return OnDemandResult()
         if self._od_lock.locked():
-            return RefreshResult()
+            return OnDemandResult()
         async with self._od_lock:
             now = time.monotonic()
             if now - self._od_last < min_interval:
-                return RefreshResult()
-            result = await self.refresh_scheduled()
+                return OnDemandResult()
+
+            # Sample a subset of available accounts instead of refreshing all.
+            sample_size = int(
+                get_config("account.refresh.on_demand_429_sample_size", 100)
+            )
+            snapshot = await self._repo.runtime_snapshot()
+            available = [
+                r for r in snapshot.items
+                if is_manageable(r) and r.status == AccountStatus.ACTIVE
+            ]
+            if not available:
+                self._od_last = time.monotonic()
+                return OnDemandResult()
+
+            # Exclude the triggering token (already known to be 429'd).
+            if triggered_by_token:
+                available = [r for r in available if r.token != triggered_by_token]
+            if not available:
+                self._od_last = time.monotonic()
+                return OnDemandResult()
+
+            # Random sample to avoid always hitting the same accounts first.
+            if len(available) > sample_size:
+                available = _random.sample(available, sample_size)
+
+            concurrency = get_config("account.refresh.usage_concurrency", 5)
+            results = await run_batch(
+                available,
+                lambda r: self._refresh_one(r, apply_fallback=False),
+                concurrency=concurrency,
+            )
+            agg = RefreshResult()
+            for r in results:
+                agg.merge(r)
             self._od_last = time.monotonic()
-            return result
+
+            # Server block detection: if ALL sampled accounts failed
+            # (and we had accounts to test), it's likely a server-level block.
+            server_blocked = (
+                len(available) > 0
+                and agg.checked > 0
+                and agg.refreshed == 0
+                and agg.failed == agg.checked
+            )
+
+            if server_blocked:
+                logger.warning(
+                    "account on-demand refresh detected possible server block: "
+                    "sampled={} all_failed=true — upstream may be blocking this IP",
+                    len(available),
+                )
+            else:
+                logger.info(
+                    "account on-demand refresh completed: sampled={} "
+                    "refreshed={} failed={} server_blocked=false",
+                    len(available),
+                    agg.refreshed,
+                    agg.failed,
+                )
+
+            return OnDemandResult(
+                refresh_result=agg,
+                server_blocked=server_blocked,
+                sampled=len(available),
+            )
 
     async def refresh_token_only(self, token: str, pool: str | None = None) -> RefreshResult:
         """Refresh a single token — used by the 429 hot-path so a single failure
@@ -746,4 +947,4 @@ class _FailureCoalescer:
                 logger.debug("failure coalescer patch write error: {}", e)
 
 
-__all__ = ["AccountRefreshService", "RefreshResult"]
+__all__ = ["AccountRefreshService", "RefreshResult", "OnDemandResult"]

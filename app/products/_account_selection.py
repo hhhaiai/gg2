@@ -47,12 +47,15 @@ async def reserve_account(
     *,
     exclude_tokens: list[str] | None = None,
     now_s_override: int | None = None,
+    triggered_by_token: str | None = None,
 ):
-    """Reserve an account and return ``(lease, selected_mode_id)``.
+    """Reserve an account and return ``(lease, selected_mode_id, server_blocked)``.
 
-    Returns ``(None, original_mode_id)`` when no account is available. Under the
-    random strategy no on-demand refresh fallback is attempted — upstream quota
-    data is never probed.
+    Returns ``(None, original_mode_id, False)`` when no account is available.
+    Under the random strategy no on-demand refresh fallback is attempted.
+
+    When ``server_blocked`` is True, the caller should surface a notification
+    to the UI indicating the upstream server may be blocking this IP.
     """
     original_mode_id = int(spec.mode_id)
 
@@ -70,16 +73,24 @@ async def reserve_account(
 
     lease, selected_mode_id = await _try_reserve()
     if lease is not None:
-        return lease, selected_mode_id
+        return lease, selected_mode_id, False
 
     if current_strategy() == "random":
-        return None, original_mode_id
+        return None, original_mode_id, False
 
     refresh_svc = get_refresh_service()
     if refresh_svc is not None:
-        await refresh_svc.refresh_on_demand()
+        od_result = await refresh_svc.refresh_on_demand(
+            triggered_by_token=triggered_by_token,
+        )
+        if od_result.server_blocked:
+            # Server-level block detected: no accounts will work.
+            # Return immediately so the caller can notify the UI.
+            return None, original_mode_id, True
+        # Even if not server-blocked, try reserving again — some
+        # accounts may have recovered.
         lease, selected_mode_id = await _try_reserve()
         if lease is not None:
-            return lease, selected_mode_id
+            return lease, selected_mode_id, False
 
-    return None, original_mode_id
+    return None, original_mode_id, False

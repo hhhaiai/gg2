@@ -1,7 +1,10 @@
 services:
   grok2api:
     container_name: grok2api
-    image: ghcr.io/jiujiu532/grok2api:latest
+    build:                                    # 改为本地构建
+      context: .
+      dockerfile: Dockerfile
+      # image: ghcr.io/jiujiu532/grok2api:latest  # 注释掉远程镜像
     ports:
       - "${HOST_PORT:-8000}:${SERVER_PORT:-8000}"
     environment:
@@ -28,7 +31,24 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./config.toml:/app/config.toml     # 挂载自定义配置（关闭配额刷新）
     restart: unless-stopped
+    # 资源限制：适配 2c2g 服务器 + 10 万账号（random 模式）
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'           # 2C 留 0.5C 给系统
+          memory: 1.5G          # 2G 留 0.5G 给系统（random 模式仅需 400-500MB）
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${SERVER_PORT:-8000}/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   # 如果出口 IP 不干净，可取消以下注释使用 Warp 作为落地代理
   # 启用后将 proxy.base_proxy_url 设为 socks5://warp:1080

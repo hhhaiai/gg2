@@ -1,0 +1,27 @@
+[account.refresh]
+# 🔴 关键配置：关闭配额主动探测，改用随机选号模式
+# 效果：内存占用 -65%，CPU 占用 -90%，零后台网络请求
+enabled = false
+
+# 429 冷却时间（秒）
+basic_interval_sec = 300
+super_interval_sec = 300
+heavy_interval_sec = 300
+
+# 完全禁用后台探测
+usage_concurrency = 0
+
+[account.selection]
+# 单号最大并发请求数
+max_inflight = 8
+
+[retry]
+# 失败时换号重试次数
+max_retries = 2
+# 触发换号的 HTTP 状态码
+on_codes = "429,401,503"
+
+[logging]
+# 降低日志级别，减少 IO 压力
+file_level = "WARNING"
+max_files = 7

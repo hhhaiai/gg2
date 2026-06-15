@@ -85,7 +85,7 @@ async def create(
         async def _run_stream() -> AsyncGenerator[str, None]:
             excluded: list[str] = []
             for attempt in range(max_retries + 1):
-                acct, selected_mode_id = await reserve_account(
+                acct, selected_mode_id, _server_blocked = await reserve_account(
                     directory, spec, now_s_override=now_s(),
                     exclude_tokens=excluded or None,
                 )
@@ -269,7 +269,7 @@ async def create(
     # ── Non-streaming ─────────────────────────────────────────────────────────
     excluded: list[str] = []
     for attempt in range(max_retries + 1):
-        acct, selected_mode_id = await reserve_account(
+        acct, selected_mode_id, _server_blocked = await reserve_account(
             directory, spec, now_s_override=now_s(),
             exclude_tokens=excluded or None,
         )
