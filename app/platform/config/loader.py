@@ -4,7 +4,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-import tomllib
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:
+    import tomli as tomllib  # fallback for Python 3.10
 
 
 def _flatten(mapping: dict[str, Any], prefix: str = "") -> dict[str, Any]:

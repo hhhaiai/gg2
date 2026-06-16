@@ -1,6 +1,6 @@
 """Platform-level exception hierarchy."""
 
-from enum import StrEnum
+from app.platform.compat import StrEnum
 
 
 class ErrorKind(StrEnum):

@@ -1,6 +1,8 @@
 """Control-plane proxy domain models."""
 
-from enum import IntEnum, StrEnum
+from enum import IntEnum
+
+from app.platform.compat import StrEnum
 from typing import Self
 
 from pydantic import BaseModel

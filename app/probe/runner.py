@@ -98,6 +98,8 @@ class ProbeRunner:
                 raise
             except Exception as exc:
                 logger.warning("probe cycle error: err={}", exc)
+                # Sleep before retrying to avoid tight error loops
+                await asyncio.sleep(60)
                 cycle_count = 0
 
             if cycle_count == 0:

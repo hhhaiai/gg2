@@ -1,6 +1,8 @@
 """Control-plane account enumerations."""
 
-from enum import IntEnum, StrEnum
+from enum import IntEnum
+
+from app.platform.compat import StrEnum
 
 
 class AccountStatus(StrEnum):
