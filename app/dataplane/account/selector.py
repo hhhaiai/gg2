@@ -426,23 +426,39 @@ def _fast_pick(
 ) -> int | None:
     """Pick from the top-N% fastest probed accounts; fall back to random
     when no account in *working* has been probed yet.
+
+    Optimized: uses pre-sorted latency_sorted_indices cache (rebuilt every 60s)
+    for near-O(1) selection instead of O(n log n) sorting on every request.
     """
     if not working:
         return None
 
-    latency_col = table.last_latency_col()
-    probe_col   = table.last_probe_col()
+    # Fast path: use pre-sorted cache if available
+    sorted_indices = table.latency_sorted_indices
+    if sorted_indices:
+        top_pct = _get_fast_top_pct()
+        top_n = max(1, int(len(sorted_indices) * top_pct))
 
-    probed = [idx for idx in working
-              if int(probe_col[idx]) > 0 and int(latency_col[idx]) > 0]
-    if not probed:
-        # Nothing has been probed yet — uniform random so we still serve traffic.
-        return random.choice(tuple(working))
+        # Optimization: directly sample from top_n until we find one in working
+        # Average case: O(1) when working set is large (most accounts available)
+        # Worst case: O(k) when working set is very small
+        top_candidates = sorted_indices[:top_n]
 
-    probed.sort(key=lambda i: int(latency_col[i]))
-    top_pct = _get_fast_top_pct()
-    top_n = max(1, int(len(probed) * top_pct))
-    return random.choice(probed[:top_n])
+        if len(working) >= len(sorted_indices) * 0.5:
+            # Working set is large (>50% of probed) — most candidates are valid
+            # Sample until we hit one in working (expected 1-2 tries)
+            for _ in range(10):  # limit retries
+                candidate = random.choice(top_candidates)
+                if candidate in working:
+                    return candidate
+
+        # Small working set or fallback: filter then choose
+        candidates = [idx for idx in top_candidates if idx in working]
+        if candidates:
+            return random.choice(candidates)
+
+    # Fallback: no probed accounts yet — uniform random so we still serve traffic
+    return random.choice(tuple(working))
 
 
 # ---------------------------------------------------------------------------

@@ -188,6 +188,11 @@ class AccountRuntimeTable:
         default_factory=lambda: array.array("L")
     )
 
+    # --- Fast selector optimization: pre-sorted indices cache ---
+    # Indices sorted by latency (ascending), excluding non-probed accounts.
+    # Rebuilt by sync_latency_from_db() every 60s to amortize O(n log n) sort.
+    latency_sorted_indices: list[int] = field(default_factory=list)
+
     # --- Pre-computed selection indexes ---
     # (pool_id, mode_id) → set of idx with a supported quota window and status == ACTIVE
     mode_available: dict[tuple[int, int], set[int]] = field(default_factory=dict)
@@ -261,6 +266,26 @@ class AccountRuntimeTable:
 
     def last_probe_col(self) -> "array.array[int]":
         return self.last_probe_s_by_idx
+
+    def rebuild_latency_sorted_cache(self) -> None:
+        """Rebuild latency_sorted_indices from current latency data.
+
+        Called by sync_latency_from_db() after applying latency updates.
+        Amortizes O(n log n) sort over 60s sync interval so _fast_pick is O(1).
+        """
+        latency_col = self.last_latency_ms_by_idx
+        probe_col = self.last_probe_s_by_idx
+
+        # Collect all probed indices
+        probed = [
+            idx for idx in range(len(latency_col))
+            if int(probe_col[idx]) > 0 and int(latency_col[idx]) > 0
+        ]
+
+        # Sort by latency ascending
+        probed.sort(key=lambda i: int(latency_col[i]))
+
+        self.latency_sorted_indices = probed
 
     def _add_to_indexes(self, idx: int) -> None:
         pool_id   = int(self.pool_by_idx[idx])

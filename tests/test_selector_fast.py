@@ -40,6 +40,8 @@ def _build_basic_table() -> AccountRuntimeTable:
             last_probe_s=int(time.time()),
             tags=[],
         )
+    # Rebuild latency-sorted cache after adding all accounts
+    table.rebuild_latency_sorted_cache()
     return table
 
 
@@ -69,6 +71,9 @@ class FastSelectorTests(unittest.TestCase):
         for i in range(len(table.token_by_idx)):
             table.last_probe_s_by_idx[i] = 0
             table.last_latency_ms_by_idx[i] = 0
+
+        # Rebuild cache after clearing probe data
+        table.rebuild_latency_sorted_cache()
 
         # Run many picks; check the chosen token set covers at least 3 of 5.
         picks = set()
@@ -103,6 +108,9 @@ class FastSelectorTests(unittest.TestCase):
                 last_latency_ms=lat, last_probe_s=int(time.time()),
                 tags=[],
             )
+
+        # Rebuild cache after adding all accounts
+        table.rebuild_latency_sorted_cache()
 
         chosen = set()
         for _ in range(50):

@@ -121,6 +121,11 @@ class AccountDirectory:
                     applied += 1
                     if probe_at_ms > max_seen:
                         max_seen = probe_at_ms
+
+                # Rebuild the latency-sorted cache after applying updates
+                if applied > 0:
+                    table.rebuild_latency_sorted_cache()
+
                 self._latency_watermark_ms = max_seen
 
             if applied:
